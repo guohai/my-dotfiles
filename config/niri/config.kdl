@@ -421,8 +421,22 @@ binds {
     Super+Shift+4 hotkey-overlay-title="Screenshot: region -> annotate" {
         spawn-sh "grim -g \"$(slurp)\" - | satty --filename - --copy-command wl-copy --early-exit --output-filename ~/Pictures/Screenshots/satty-$(date +%Y-%m-%d_%H-%M-%S).png";
     }
-    Super+Shift+5 hotkey-overlay-title="Screen recording: kooha" {
-        spawn "kooha";
+    // Screen recording, macOS-style: Cmd+Shift+5. Both binds are toggles --
+    // press either one again to stop, whichever one started it. The recording
+    // lands in ~/Videos and its path goes to the clipboard on stop.
+    //
+    // These used to launch kooha, which cannot record under niri at all: it
+    // captures via xdg-desktop-portal -> PipeWire, and niri only offers DMA-BUF
+    // buffers there while kooha's pipewiresrc only accepts system memory. The
+    // link errors out with "no more input formats" before the first frame.
+    // screen-record uses wf-recorder instead, which talks
+    // zwlr_screencopy_manager_v1 straight to niri -- the same protocol the grim
+    // binds above already use. Defined in configuration.nix (recordCmd).
+    Super+Shift+5 hotkey-overlay-title="Screen recording: whole screen (toggle)" {
+        spawn "screen-record";
+    }
+    Super+Ctrl+Shift+5 hotkey-overlay-title="Screen recording: region (toggle)" {
+        spawn "screen-record" "region";
     }
     // Lock the screen. Ctrl+Cmd+Q is the macOS chord.
     //

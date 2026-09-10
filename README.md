@@ -53,7 +53,7 @@ Everything below is declared in `nixos/configuration.nix` — there is nothing t
 | | |
 | --- | --- |
 | **grim + slurp + satty** | Screenshots. `⌘+Shift+3` whole screen, `⌘+Shift+4` drag a region — both open satty to annotate, then copy to the clipboard and save to `~/Pictures/Screenshots/`. niri's own `Print` / `Ctrl+Print` / `Alt+Print` are also bound — picker / whole screen / focused window, saved straight to disk with no annotation step — but an Apple keyboard has no Print key. |
-| **kooha** | Screen recording. |
+| **wf-recorder** | Screen recording, driven by the `screen-record` toggle (defined in `configuration.nix`). `⌘+Shift+5` records the focused screen, `⌘+Ctrl+Shift+5` drags a region. Press the same chord again to stop — either one stops a recording, whichever started it. Video goes to `~/Videos/Screen Recording <date>.mp4` and its path lands on the clipboard when you stop. Records system audio by default (`screen-record full mute` from a shell for silent). H.264 on the GPU via VA-API, falling back to x264 on the CPU. |
 | **ffmpeg-full** | Full ffmpeg with every codec and filter enabled. |
 | **playerctl** | Media keys (play/pause/next) against MPRIS. |
 | **wl-clipboard + cliphist + wl-clip-persist** | Clipboard, searchable clipboard history, and clipboard survival after the source app closes. |
@@ -417,6 +417,23 @@ wallpaper is deliberately visible for 30 seconds before the backlight dies.
 
 **Quickshell's `shell.qml` lives outside the Nix store on purpose,** as a real
 writable file, so Quickshell hot-reloads edits instead of needing a rebuild.
+
+**Screen recording bypasses xdg-desktop-portal entirely.** Every portal-based
+recorder — Kooha, OBS's built-in capture, GNOME's — fails under niri on this
+machine, and the failure looks like a bug in the recorder: *"Failed to
+initialize pipeline state to playing / Element failed to change its state"*. It
+is neither side's bug. niri offers screencast buffers as DMA-BUF only (a single
+format, `BGRx`, carrying a mandatory `Format:Video:modifier` property), while
+GStreamer's `pipewiresrc` advertises 34 system-memory formats and no modifiers.
+The two sets do not intersect, so PipeWire kills the link with `no more input
+formats` before the first frame moves. Nothing in this repo can reach that —
+it is upstream code on both sides.
+
+`wf-recorder` avoids the problem by not using the portal at all: it speaks
+`zwlr_screencopy_manager_v1` directly to niri, which is the same protocol `grim`
+uses for the screenshot binds, already proven working here. If you ever want a
+GUI recorder back, check whether `pipewiresrc` has learned to negotiate
+modifiers first — otherwise it will fail exactly the same way.
 
 **NetBird runs unhardened.** Hardened mode uses `ProtectSystem = "strict"`
 (read-only `/etc`) and its DNS integration assumes systemd-resolved. This system

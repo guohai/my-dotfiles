@@ -2,90 +2,40 @@
 # your system. Help is available in the configuration.nix(5) man page, on
 # https://search.nixos.org/options and in the NixOS manual (`nixos-help`).
 #
-# ############################################################################
-# ##  STOP -- CHANGE THESE THREE THINGS BEFORE YOU REBUILD                  ##
-# ############################################################################
+# ============================================================================
+# PORTABILITY -- read this first if you are restoring on another machine
+# ============================================================================
+# This config was written for a MacBookPro14,1 (13-inch Intel, 2017) running
+# niri on Wayland. Most of it is hardware-agnostic, but the items below are
+# NOT. Each site is also marked inline with `PORTABILITY:` so you can find
+# them with:  grep -n 'PORTABILITY:' configuration.nix
 #
-# This is someone else's laptop config. It was written for a MacBookPro14,1
-# (13-inch Intel, 2017) running niri on Wayland, for a user named `brent`.
-# Rebuilding it unchanged will create the wrong user and try to build a camera
-# driver for hardware you almost certainly do not have.
-#
-# Find every machine-specific line with:
-#     grep -n 'PORTABILITY:' configuration.nix
-#
-# ---------------------------------------------------------------------------
-# 1. YOUR USERNAME  -- everybody has their own; this one says `brent`
-# ---------------------------------------------------------------------------
-#    The name `brent` appears in TWO places that must be changed TOGETHER:
-#        users.users.brent          (the system account)
-#        home-manager.users.brent   (that account's dotfiles)
-#    plus one cosmetic spot: the `--user brent` flag on the tuigreet login
-#    command, which just prefills the username on the login screen.
-#
-#    Change all of them at once:
-#        sed -i 's/\bbrent\b/YOURNAME/g' configuration.nix
-#
-#    If you rename only the first, the build still SUCCEEDS -- home-manager
-#    quietly configures a user that does not exist, and you log in to a
-#    completely unconfigured desktop with no bar, no keybinds and no shell
-#    setup. That failure is silent, which is why it is listed first here.
-#
-# ---------------------------------------------------------------------------
-# 2. YOUR CAMERA  -- everybody's is different; this one is an Apple internal
-# ---------------------------------------------------------------------------
-#    hardware.facetimehd.enable / .withCalibration are for Apple Intel Macs
-#    ONLY. The camera in these machines is not a USB webcam -- it is a Broadcom
-#    1570 sensor sitting on the PCIe bus (PCI id 14e4:1570), which needs an
-#    out-of-tree kernel module plus a firmware blob extracted from a macOS
-#    driver package.
-#
-#    * On any non-Apple machine: DELETE both lines. Nearly every other webcam,
-#      internal or USB, is UVC and works with zero configuration -- the kernel
-#      driver is already built in. Plug it in, /dev/video0 appears, done.
-#    * On an Apple Silicon Mac: DELETE both lines too. This driver is for Intel
-#      Macs; Apple Silicon cameras are handled elsewhere entirely.
-#    * Keeping them on the wrong hardware costs you a pointless out-of-tree
-#      module build on every kernel update, and can break rebuilds outright
-#      when that module fails to compile against a newer kernel.
-#
-#    To check what you actually have, after booting:
-#        lsusb | grep -i cam          # a USB/UVC webcam shows up here
-#        ls /sys/class/video4linux/   # any working camera shows up here
-#
-# ---------------------------------------------------------------------------
-# 3. YOUR DISKS  -- hardware-configuration.nix is NOT in this repo
-# ---------------------------------------------------------------------------
-#    It is excluded on purpose: it contains the original laptop's filesystem
-#    UUIDs, which are meaningless on your machine and will not boot. Generate
-#    your own and never copy anyone else's:
-#        sudo nixos-generate-config
-#    Until you do, the first build fails with
-#        error: path '.../hardware-configuration.nix' does not exist
-#    That is expected, not a broken repo.
-#
-# ############################################################################
-#
-# ALSO WORTH REVIEWING (these will work as-is, they just may not suit you):
-#
+# MUST change on other hardware:
+#   * hardware-configuration.nix -- NOT shipped with these dotfiles on purpose.
+#     It contains this laptop's filesystem UUIDs. Generate your own with
+#     `nixos-generate-config` and never copy someone else's.
+#   * hardware.facetimehd.*  -- Apple Intel Macs ONLY. It builds an out-of-tree
+#     kernel module for the Broadcom 1570 PCIe camera (PCI 14e4:1570). On any
+#     non-Apple machine this is useless at best. Delete it; a normal USB webcam
+#     needs no configuration at all.
 #   * boot.loader.systemd-boot -- assumes UEFI. A BIOS/legacy machine needs
-#     boot.loader.grub instead, or the system builds fine and then will not
-#     boot.
-#   * boot.kernelParams = [ "mem_sleep_default=s2idle" ] -- an Apple laptop
-#     suspend fix. Harmless elsewhere, but it costs battery: s2idle drains
-#     noticeably faster than the kernel default. Delete it on non-Apple
-#     hardware.
-#   * time.timeZone -- set to America/Los_Angeles.
-#   * console.font = "ter-v32n" -- a 32px console font, sized for a HiDPI
-#     retina panel. On a 1080p screen it is comically large; try "ter-v16n".
-#   * The Mac-style key remapping maps the Super/Windows key to Cmd. That works
-#     fine on a PC keyboard, but the muscle memory it targets is macOS'. If you
-#     have never used a Mac, you may simply not want the xremap section at all.
+#     boot.loader.grub instead.
 #
-# SAFE EVERYWHERE, no changes needed: the niri/Quickshell desktop, terminals
-# (kitty + foot), fish, Zed, mpv, the lock screen, the audio/bluetooth/wifi
-# pickers, clipboard history, screenshots, screen recording, NetBird, sshd.
-# ############################################################################
+# SHOULD review:
+#   * time.timeZone -- set to America/Los_Angeles.
+#   * console.font = "ter-v32n" -- a 32px console font, chosen because this is
+#     a HiDPI/retina panel. On a 1080p screen it is comically large; try
+#     "ter-v16n" or drop the console block entirely.
+#   * The username is `lab`, in users.users.lab and home-manager.users.lab.
+#     Rename BOTH or home-manager will silently configure nobody.
+#   * Apple keyboards have no separate Super/Cmd distinction the way PC
+#     keyboards do. The Mac-style key remapping (see the xremap section) maps
+#     the Super/Windows key to Cmd, which is what you want on a PC keyboard
+#     too, but the muscle memory it targets is macOS'.
+#
+# Safe everywhere: the niri/Quickshell desktop, terminals, fish, Zed, mpv,
+# lock screen, audio/bluetooth/wifi pickers, NetBird, sshd.
+# ============================================================================
 
 { config, lib, pkgs, ... }:
 
@@ -302,6 +252,177 @@ let
       "$@"
   '';
 
+  # One command behind both recording binds (config.kdl Super+Shift+5 and
+  # Super+Ctrl+Shift+5). It is a *toggle*: the same chord that starts a
+  # recording stops it, so there is nothing to remember and no second key to
+  # learn.
+  #
+  #   screen-record                -- focused output, with system audio
+  #   screen-record region         -- drag a box with slurp first
+  #   screen-record full   mute    -- no audio
+  #   screen-record region mute
+  #
+  # Only the first two are bound to keys; `mute` is there for the shell.
+  #
+  # Why wf-recorder and not kooha, which used to be on this bind: kooha records
+  # through xdg-desktop-portal -> PipeWire, and that path is broken under niri
+  # on this machine. niri offers screencast buffers as DMA-BUF only (one
+  # format, BGRx, with a mandatory Format:Video:modifier property); kooha's
+  # pipewiresrc advertises 34 system-memory formats and no modifiers. The two
+  # sets do not intersect, so the link dies with "no more input formats" before
+  # a single frame moves and GStreamer never reaches PLAYING. That is upstream
+  # code on both sides, not anything configurable here.
+  #
+  # wf-recorder sidesteps the whole portal stack: it speaks
+  # zwlr_screencopy_manager_v1 straight to niri -- the same protocol grim
+  # already uses for the screenshot binds above, which is why this was the safe
+  # bet. It consumes niri's DMA-BUF buffers happily ("enabled DMA-BUF capture"
+  # in its own log), which is precisely what kooha could not do.
+  recordCmd = pkgs.writeShellScriptBin "screen-record" ''
+    set -u
+    export PATH=${
+      lib.makeBinPath [
+        pkgs.wf-recorder
+        pkgs.slurp
+        pkgs.libnotify
+        pkgs.wl-clipboard
+        pkgs.niri
+        pkgs.procps
+        pkgs.coreutils
+        pkgs.gnused
+      ]
+    }
+
+    # Where the in-progress filename is parked so the stop branch, which is a
+    # completely separate invocation of this script, can name the file it just
+    # finished. Falls back to /tmp only if the session has no runtime dir.
+    state="''${XDG_RUNTIME_DIR:-/tmp}/screen-record.path"
+
+    # --- Stop branch -------------------------------------------------------
+    # pkill's exit status doubles as "was anything recording?", so this is both
+    # the test and the action. Either bind lands here, which is what makes the
+    # toggle work regardless of which one started the recording.
+    #
+    # SIGINT, not the default SIGTERM: wf-recorder traps INT to flush the
+    # encoder and write the MP4 moov atom. Killed with TERM you get a file with
+    # no index -- unseekable, and most players refuse to open it at all.
+    if pkill -INT -x wf-recorder 2>/dev/null; then
+      # Wait for the flush instead of racing it, or the size check below reads
+      # the file before the index is written. Five seconds is far more than a
+      # local encoder needs; it exists so a wedged process cannot hang the bind.
+      for _ in $(seq 1 50); do
+        pgrep -x wf-recorder >/dev/null || break
+        sleep 0.1
+      done
+
+      out=$(cat "$state" 2>/dev/null || true)
+      rm -f "$state"
+
+      if [ -n "$out" ] && [ -s "$out" ]; then
+        # The path, not the video, goes to the clipboard: it is what you
+        # actually want next (paste into a chat box, an upload dialog, mpv).
+        printf '%s' "$out" | wl-copy
+        notify-send -a screen-record -i video-x-generic \
+          "Recording saved" "$(basename "$out") -- path copied to clipboard"
+      else
+        notify-send -a screen-record -u critical \
+          "Recording failed" "wf-recorder stopped without writing a file."
+      fi
+      exit 0
+    fi
+
+    # --- Start branch ------------------------------------------------------
+    mkdir -p ~/Videos
+    out=~/Videos/"Screen Recording $(date '+%Y-%m-%d %H-%M-%S').mp4"
+
+    case "''${1:-full}" in
+      region)
+        # slurp writes "X,Y WxH", which is exactly what -g expects. Cancelling
+        # with Escape makes it exit non-zero, and that must abort quietly --
+        # otherwise pressing Escape would start a full-screen recording, which
+        # is the opposite of what the user just asked for.
+        geom=$(slurp) || exit 0
+        [ -n "$geom" ] || exit 0
+        target=(-g "$geom")
+        label="region"
+        ;;
+      *)
+        # The focused output, not "the only output" -- with an external display
+        # attached wf-recorder cannot guess, and records the wrong screen or
+        # refuses outright. Parsed with sed rather than jq to avoid pulling jq
+        # in for one field; `name` is the only key by that spelling in this
+        # object (the others are make/model/serial), so the greedy match is
+        # unambiguous.
+        name=$(niri msg --json focused-output |
+          sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+        [ -n "$name" ] || {
+          notify-send -a screen-record -u critical \
+            "Recording failed" "Could not determine the focused output."
+          exit 1
+        }
+        target=(-o "$name")
+        label="$name"
+        ;;
+    esac
+
+    # System audio -- what is coming out of the speakers, not the microphone.
+    # A bare `--audio` would record the default *source*, which is the built-in
+    # mic; the sound of the machine is the default *sink's* monitor.
+    #
+    # @DEFAULT_MONITOR@ is resolved by the PulseAudio server (pipewire-pulse
+    # here, services.pipewire.pulse.enable below), so this needs no pactl at
+    # build or run time and, more usefully, follows the default sink -- plug in
+    # headphones or connect a Bluetooth speaker mid-recording and the capture
+    # moves with it. Hardcoding alsa_output.pci-....monitor would not.
+    #
+    # For the microphone instead, or both, this is the flag to change:
+    # `--audio=@DEFAULT_SOURCE@` for mic. wf-recorder takes one device only, so
+    # mic+system together needs a PipeWire loopback and is out of scope here.
+    audio=(--audio=@DEFAULT_MONITOR@)
+    sound="sound"
+    if [ "''${2:-}" = mute ]; then
+      audio=()
+      sound="silent"
+    fi
+
+    printf '%s' "$out" > "$state"
+
+    # Start, then check it is still alive a beat later. wf-recorder fails by
+    # exiting during encoder setup, not by returning an error to the shell, so
+    # backgrounding it and looking again is the only honest test.
+    try() {
+      wf-recorder "$@" "''${target[@]}" -f "$out" >/dev/null 2>&1 &
+      sleep 1.5
+      pgrep -x wf-recorder >/dev/null
+    }
+
+    # Rungs, in order of preference. GPU encode first: this panel is 2560x1600
+    # and the CPU is a dual-core i5-7360U, so x264 at full size drops frames and
+    # pins both cores. VA-API is not a nicety here.
+    #
+    # Every rung is a real failure mode seen on this machine, not defensive
+    # padding. The GPU rung fails outright if intel-media-driver is missing from
+    # hardware.graphics (verified: "Failed to initialise VAAPI connection"), and
+    # audio takes the whole process down with it if pipewire-pulse is not up
+    # yet -- which is easy to hit when the bind is pressed seconds after login.
+    # Losing the sound is a far better outcome than losing the recording.
+    if try -c h264_vaapi -d /dev/dri/renderD128 "''${audio[@]}"; then
+      enc="GPU, $sound"
+    elif try "''${audio[@]}"; then
+      enc="CPU, $sound"
+    elif [ ''${#audio[@]} -gt 0 ] && try -c h264_vaapi -d /dev/dri/renderD128; then
+      enc="GPU, no audio"
+    else
+      rm -f "$state"
+      notify-send -a screen-record -u critical \
+        "Recording failed to start" "wf-recorder exited immediately."
+      exit 1
+    fi
+
+    notify-send -a screen-record -i media-record \
+      "Recording $label ($enc)" "Press the same keys again to stop."
+  '';
+
   # xremap built with the `niri` cargo feature (nixpkgs exposes the feature set
   # via withVariant; see pkgs/by-name/xr/xremap/package.nix). The niri variant
   # queries niri's IPC socket for the focused window's app_id, and that per-app
@@ -318,6 +439,35 @@ in
   # group 0660 on /dev/uinput.
   hardware.uinput.enable = true;
 
+  # --- VA-API: hardware video encode and decode ---
+  # The GPU here is Iris Plus 650 (Kaby Lake, Gen9.5). Without this block the
+  # kernel driver is loaded and the desktop composites fine, but there is no
+  # userspace VA-API driver, so every video encode and decode runs on a
+  # dual-core i5-7360U in software.
+  #
+  # What it buys, concretely: `screen-record` encodes 2560x1600 H.264 on the
+  # GPU instead of pinning both cores with x264 (its CPU fallback exists, but
+  # drops frames at this resolution). Chrome and mpv also pick this up for
+  # H.264/HEVC/VP9 playback, which is the difference between a warm laptop and
+  # a loud one on a long video.
+  #
+  # iHD (intel-media-driver) and not i965 (intel-vaapi-driver): Kaby Lake is
+  # inside iHD's Broadwell-and-newer range, i965 is the legacy driver and is no
+  # longer developed. Verified on this machine -- vainfo reports the iHD driver
+  # and a hardware VAEntrypointEncSlice for H.264.
+  #
+  # LIBVA_DRIVER_NAME is set below in environment.sessionVariables. libva can
+  # usually infer it from the DRM device, but pinning it removes a probe that
+  # silently falls back to software when it guesses wrong.
+  hardware.graphics = {
+    enable = true;
+    extraPackages = with pkgs; [
+      intel-media-driver
+      # The `vainfo` binary, for checking any of the above is actually true.
+      libva-utils
+    ];
+  };
+
   # Runs inside the graphical session because it needs NIRI_SOCKET, which niri
   # publishes into the systemd --user environment when it starts.
   systemd.user.services.xremap = {
@@ -332,7 +482,7 @@ in
     };
   };
 
-  # Interactive shell for the brent account. Enabling it here (rather than just
+  # Interactive shell for the lab account. Enabling it here (rather than just
   # adding pkgs.fish to systemPackages) is what registers fish in /etc/shells,
   # sets up $PATH via the NixOS shell init, and links the vendor completions
   # that Nix packages ship under share/fish/vendor_completions.d. Without this
@@ -349,14 +499,14 @@ in
   home-manager = {
     # Use the system's pkgs rather than a second, independently-pinned nixpkgs.
     useGlobalPkgs = true;
-    # Install user packages into /etc/profiles/per-user/brent.
+    # Install user packages into /etc/profiles/per-user/lab.
     useUserPackages = true;
     # Instead of aborting when an unmanaged dotfile is in the way, rename it to
     # <name>.hm-bak. This is what makes the first switch survive the existing
     # hand-written kitty.conf / foot.ini.
     backupFileExtension = "hm-bak";
 
-    users.brent = { ... }: {
+    users.lab = { ... }: {
       home.stateVersion = "26.05";
 
       programs.fish = {
@@ -737,15 +887,12 @@ in
 
   # Normal (non-root) desktop account. Chrome and other browsers refuse to run
   # as root without --no-sandbox, so log into niri as this user, not as root.
-  # PORTABILITY: *** CHANGE ME *** the username `brent` is hardcoded here AND
-  # in `home-manager.users.brent` further down. Rename BOTH together with
-  #     sed -i 's/\bbrent\b/YOURNAME/g' configuration.nix
-  # If you rename only this one the build still SUCCEEDS, but home-manager
-  # configures a user that does not exist and you log in to a bare desktop
-  # with no bar, no keybinds and no shell setup. The failure is silent.
-  users.users.brent = {
+  # PORTABILITY: the username `lab` is hardcoded here AND in
+  # `home-manager.users.lab` further down. Rename BOTH together, or
+  # home-manager will happily configure a user that does not exist.
+  users.users.lab = {
     isNormalUser = true;
-    description = "brent";
+    description = "lab";
     # input  -> read /dev/input/event* (xremap grabs the keyboard)
     # uinput -> write /dev/uinput (xremap emits the rewritten events)
     extraGroups = [ "wheel" "networkmanager" "video" "audio" "docker" "input" "uinput" ];
@@ -760,7 +907,7 @@ in
   environment.systemPackages = with pkgs; [
     nodejs
     # Installed system-wide so every account gets it. The old npm -g install
-    # lived under /root/.npm-global, which is unreachable from the brent user
+    # lived under /root/.npm-global, which is unreachable from the lab user
     # because /root is mode 0700. Self-update is disabled (read-only Nix
     # store); bump the channel and rebuild to upgrade.
     claude-code
@@ -788,18 +935,23 @@ in
     playerctl
     # Capture stack. niri screenshots natively (Print / Ctrl+Print / Alt+Print,
     # config.kdl:~640) but cannot annotate, so grim+slurp feed satty for the
-    # Super+Shift+3/4 binds. kooha records the screen through
-    # xdg-desktop-portal, which programs.niri.enable already sets up
-    # (gnome+gtk backends, niri-portals.conf).
+    # Super+Shift+3/4 binds.
+    #
+    # All four talk zwlr_screencopy_manager_v1 directly to niri. Nothing here
+    # goes through xdg-desktop-portal, which is deliberate: the portal path is
+    # what broke kooha (see the recordCmd comment in the let block above).
     grim
     slurp
     satty
-    kooha
+    wf-recorder
+    # The Super+Shift+5 / Super+Ctrl+Shift+5 toggle. Defined in the let block
+    # above; it wraps wf-recorder, slurp and niri msg.
+    recordCmd
     # Stays system-level: xremap needs the input/uinput groups and a system
     # udev rule, so managing it per-user would split the config in two.
     xremapNiri
     # kitty, foot and quickshell are NOT here -- home-manager installs them
-    # for the brent user alongside their config (see home-manager.users.brent).
+    # for the lab user alongside their config (see home-manager.users.lab).
   ];
 
   fonts.packages = with pkgs; [
@@ -815,17 +967,20 @@ in
     QT_WAYLAND_DISABLE_WINDOWDECORATION = "1";
     SDL_VIDEODRIVER = "wayland";
     CLUTTER_BACKEND = "wayland";
+    # Pins VA-API to the iHD driver installed by hardware.graphics above. See
+    # that block for why iHD rather than i965.
+    LIBVA_DRIVER_NAME = "iHD";
   };
 
   services.greetd = {
     enable = true;
     settings = {
       default_session = {
-        # --user brent prefills the login form with the brent account. Do not add
+        # --user lab prefills the login form with the lab account. Do not add
         # --remember: it overwrites the prefill with whoever logged in last
         # (which is how root kept coming back). Press Esc at the password
         # prompt to type a different username.
-        command = "${pkgs.tuigreet}/bin/tuigreet --time --user brent --cmd niri-session";
+        command = "${pkgs.tuigreet}/bin/tuigreet --time --user lab --cmd niri-session";
         user = "greeter";
       };
     };
@@ -897,13 +1052,8 @@ in
   # importantly, unloads facetimehd across suspend and reloads it on resume --
   # the driver hard-hangs the machine on sleep otherwise. That is handled by the
   # module itself, not something to add here.
-  # PORTABILITY: *** CHANGE ME *** Apple Intel Macs ONLY.
-  # DELETE both of these lines on any other machine -- including Apple Silicon.
-  # Nearly every other webcam (internal or USB) is UVC and needs zero config:
-  # the kernel driver is built in, /dev/video0 just appears. Keeping this on
-  # the wrong hardware buys you a pointless out-of-tree module build on every
-  # kernel update, and can break rebuilds when it fails to compile.
-  # Check what you have with: ls /sys/class/video4linux/
+  # PORTABILITY: Apple Intel Macs ONLY -- delete these two lines on any other
+  # machine. A normal USB webcam needs no configuration whatsoever.
   hardware.facetimehd.enable = true;
 
   # Sensor colour calibration, also extracted from Apple's driver. Upstream
@@ -1045,7 +1195,7 @@ in
   # Password login is requested explicitly. Note that NixOS already defaults
   # PasswordAuthentication to true, but it is spelled out here so that the
   # intent is obvious and a future nixpkgs default flip cannot silently lock
-  # you out. The `brent` account already has a password set, which is what makes
+  # you out. The `lab` account already has a password set, which is what makes
   # this work -- an account with no password cannot be logged into over SSH
   # regardless of this setting.
   services.openssh = {
@@ -1056,7 +1206,7 @@ in
 
       # Root may only log in with a key, never a password. Anything exposed to
       # a network gets scanned for `root` with a password within minutes, and
-      # `brent` is in `wheel` so `sudo -i` covers every legitimate need for root.
+      # `lab` is in `wheel` so `sudo -i` covers every legitimate need for root.
       PermitRootLogin = "prohibit-password";
     };
 
