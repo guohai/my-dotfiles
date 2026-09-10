@@ -1,0 +1,32 @@
+# Machine-unique: contains this laptop's filesystem UUIDs. Every machine must
+# generate its own with `nixos-generate-config`. Never publish or copy one.
+hardware-configuration.nix
+
+# Account state and credentials -- never commit these.
+# ~/.config/netbird/     holds the logged-in account email
+# /var/lib/netbird/      holds the peer private key
+# ~/.config/gh/          holds the GitHub OAuth token, in plaintext
+netbird/
+gh/
+hosts.yml
+*.state.json
+active_profile.txt
+
+# Secrets in any form
+*.key
+*.pem
+*setup-key*
+secrets/
+.env
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
+
+# Home-manager backups of files it replaced on first activation
+*.hm-bak
+
+# Nix build results
+result
+result-*

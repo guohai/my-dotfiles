@@ -1,0 +1,49 @@
+# Mac-style Cmd (= Super) shortcuts, applied ONLY to non-terminal apps.
+#
+# Why terminals are excluded:
+#   In kitty/foot the Mac equivalents are Ctrl+Shift+C / Ctrl+Shift+V, not
+#   Ctrl+C / Ctrl+V. A blind Super+C -> Ctrl+C would send SIGINT and kill the
+#   foreground job instead of copying, and Super+Z -> Ctrl+Z would SIGTSTP it.
+#   So kitty and foot are configured natively for Super+C/V instead, in
+#   ~/.config/kitty/kitty.conf and ~/.config/foot/foot.ini.
+#
+# Keys deliberately NOT remapped here, so they pass through to niri:
+#   Super+Space  -> fuzzel (Spotlight)
+#   Super+Tab    -> focus-window-previous (Cmd+Tab)
+#   Super+Q      -> close-window (Cmd+Q)
+#   Super+Return -> foot
+# xremap sits below the compositor, so anything it rewrites is invisible to
+# niri. Only the keys listed under `remap:` are touched; everything else is
+# passed through untouched.
+#
+# App names are niri app_ids. Check one with: niri msg --json focused-window
+# or: xremap --list-windows
+
+keymap:
+  - name: Mac-style Cmd keys (GUI apps only, terminals excluded)
+    application:
+      not: [kitty, foot]
+    remap:
+      # --- editing ---
+      Super-c: C-c
+      Super-v: C-v
+      Super-x: C-x
+      Super-a: C-a
+      # Modifier matching is inexact by default, so a held Shift passes
+      # through: Super+Shift+Z arrives as Ctrl+Shift+Z (redo) for free.
+      Super-z: C-z
+      Super-s: C-s
+      Super-f: C-f
+
+      # --- browser / app ---
+      Super-t: C-t
+      Super-w: C-w
+      Super-n: C-n
+      Super-r: C-r
+      Super-l: C-l
+
+      # --- Mac text navigation ---
+      Super-left: home
+      Super-right: end
+      Super-up: C-home
+      Super-down: C-end

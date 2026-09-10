@@ -1,0 +1,401 @@
+--- a/include/swaylock.h	2026-09-09 16:20:01.374440164 -0700
++++ b/include/swaylock.h	2026-09-10 10:36:19.485864529 -0700
+@@ -73,6 +73,8 @@
+ 	bool time_effects;
+ 	bool indicator;
+ 	bool clock;
++	char *weekstr;
++	char *batstr;
+ 	char *timestr;
+ 	char *datestr;
+ 	uint32_t fade_in;
+--- a/main.c	2026-09-09 16:20:01.374605962 -0700
++++ b/main.c	2026-09-10 10:36:19.489654089 -0700
+@@ -975,6 +975,8 @@
+ 		LO_TIME_EFFECTS,
+ 		LO_INDICATOR,
+ 		LO_CLOCK,
++		LO_WEEKSTR,
++		LO_BATSTR,
+ 		LO_TIMESTR,
+ 		LO_DATESTR,
+ 		LO_FADE_IN,
+@@ -1055,6 +1057,8 @@
+ 		{"time-effects", no_argument, NULL, LO_TIME_EFFECTS},
+ 		{"indicator", no_argument, NULL, LO_INDICATOR},
+ 		{"clock", no_argument, NULL, LO_CLOCK},
++		{"weekstr", required_argument, NULL, LO_WEEKSTR},
++		{"batstr", required_argument, NULL, LO_BATSTR},
+ 		{"timestr", required_argument, NULL, LO_TIMESTR},
+ 		{"datestr", required_argument, NULL, LO_DATESTR},
+ 		{"fade-in", required_argument, NULL, LO_FADE_IN},
+@@ -1116,6 +1120,10 @@
+ 			"Always show the indicator.\n"
+ 		"  --clock                          "
+ 			"Show time and date.\n"
++		"  --weekstr <format>               "
++			"The format string for a third line above the time.\n"
++		"  --batstr <format>                "
++			"Battery line below the date. {p} = percent, {icon} = glyph.\n"
+ 		"  --timestr <format>               "
+ 			"The format string for the time. Defaults to '%T'.\n"
+ 		"  --datestr <format>               "
+@@ -1619,6 +1627,18 @@
+ 				state->args.clock = true;
+ 			}
+ 			break;
++		case LO_WEEKSTR:
++			if (state) {
++				free(state->args.weekstr);
++				state->args.weekstr = strdup(optarg);
++			}
++			break;
++		case LO_BATSTR:
++			if (state) {
++				free(state->args.batstr);
++				state->args.batstr = strdup(optarg);
++			}
++			break;
+ 		case LO_TIMESTR:
+ 			if (state) {
+ 				free(state->args.timestr);
+@@ -1843,6 +1863,8 @@
+ 		.effects_count = 0,
+ 		.indicator = false,
+ 		.clock = false,
++		.weekstr = strdup(""),
++		.batstr = strdup(""),
+ 		.timestr = strdup("%T"),
+ 		.datestr = strdup("%a, %x"),
+ 		.allow_fade = true,
+--- a/render.c	2026-09-09 16:20:01.374953484 -0700
++++ b/render.c	2026-09-10 11:02:43.453851230 -0700
+@@ -1,4 +1,7 @@
++#include <dirent.h>
+ #include <math.h>
++#include <stdio.h>
++#include <string.h>
+ #include <stdlib.h>
+ #include <time.h>
+ #include <locale.h>
+@@ -40,9 +43,186 @@
+ 	}
+ }
+ 
+-static void timetext(struct swaylock_surface *surface, char **tstr, char **dstr) {
++// Reads one integer out of a sysfs attribute. False if it is missing or
++// unparseable.
++static bool read_ps_long(const char *base, const char *dev,
++		const char *attr, long long *out) {
++	char path[512];
++	char buf[64];
++	snprintf(path, sizeof(path), "%s/%s/%s", base, dev, attr);
++	FILE *f = fopen(path, "r");
++	if (!f) {
++		return false;
++	}
++	bool ok = fgets(buf, sizeof(buf), f) != NULL;
++	fclose(f);
++	if (!ok) {
++		return false;
++	}
++	char *end;
++	long long v = strtoll(buf, &end, 10);
++	if (end == buf) {
++		return false;
++	}
++	*out = v;
++	return true;
++}
++
++// Charge level of the first battery under /sys/class/power_supply, plus
++// whether it is charging. False when the machine has no battery at all, in
++// which case the caller drops the line rather than printing a placeholder.
++static bool battery_status(int *percent, bool *charging) {
++	static const char *base = "/sys/class/power_supply";
++	DIR *dir = opendir(base);
++	if (!dir) {
++		return false;
++	}
++
++	bool found = false;
++	struct dirent *ent;
++	while (!found && (ent = readdir(dir)) != NULL) {
++		char path[512];
++		char buf[64];
++		FILE *f;
++		long long now, full, cap;
++
++		snprintf(path, sizeof(path), "%s/%s/type", base, ent->d_name);
++		if (!(f = fopen(path, "r"))) {
++			continue;
++		}
++		bool is_battery = fgets(buf, sizeof(buf), f) &&
++			strncmp(buf, "Battery", 7) == 0;
++		fclose(f);
++		if (!is_battery) {
++			continue;
++		}
++
++		// Compute now/full rather than trusting the kernel's own
++		// `capacity` attribute. Not every driver defines `capacity` the
++		// same way: the SBS driver on Apple laptops divides by
++		// charge_full_DESIGN, so a worn cell reads far lower there than
++		// it does in upower -- 57% against 83% on the machine this was
++		// written for, a battery at 68% health after 518 cycles. Nothing
++		// else the user can see reports the design-relative number, so
++		// the lock screen would be the odd one out.
++		//
++		// now/full is charge as a fraction of what the cell holds
++		// *today*, which is what upower, GNOME and the Quickshell bar
++		// all show. Drivers report either charge_* (uAh) or energy_*
++		// (uWh) -- try both, then fall back to `capacity` for anything
++		// exotic that publishes neither.
++		//
++		// This can still land a point off the bar: upower derives energy
++		// from voltage_now while the charge_* pair is voltage-free. Both
++		// round to the same integer in normal use.
++		if ((read_ps_long(base, ent->d_name, "charge_now", &now) &&
++				read_ps_long(base, ent->d_name, "charge_full", &full) &&
++				full > 0) ||
++			(read_ps_long(base, ent->d_name, "energy_now", &now) &&
++				read_ps_long(base, ent->d_name, "energy_full", &full) &&
++				full > 0)) {
++			// Round to nearest, like everything else does. Truncating
++			// would sit a point low for most of the battery's life.
++			*percent = (int)((now * 100 + full / 2) / full);
++			found = true;
++		} else if (read_ps_long(base, ent->d_name, "capacity", &cap)) {
++			*percent = (int)cap;
++			found = true;
++		}
++		if (!found) {
++			continue;
++		}
++
++		// A full cell often reads slightly over its own charge_full.
++		if (*percent < 0) {
++			*percent = 0;
++		} else if (*percent > 100) {
++			*percent = 100;
++		}
++
++		*charging = false;
++		snprintf(path, sizeof(path), "%s/%s/status", base, ent->d_name);
++		if ((f = fopen(path, "r"))) {
++			if (fgets(buf, sizeof(buf), f)) {
++				*charging = strncmp(buf, "Charging", 8) == 0 ||
++					strncmp(buf, "Full", 4) == 0;
++			}
++			fclose(f);
++		}
++	}
++	closedir(dir);
++	return found;
++}
++
++// Expands --batstr. Two tokens: {p} is the percentage as a bare number, {icon}
++// is a Nerd Font battery glyph picked from the charge level (or the charging
++// bolt). Anything else in the format string is copied through, so the caller
++// controls the wording -- "{icon} {p}%", "bat {p}%", whatever.
++static void battext(struct swaylock_surface *surface, char **bstr) {
++	static char bbuf[256];
++
++	*bstr = NULL;
++	if (!surface->state->args.batstr[0]) {
++		return;
++	}
++
++	int percent = 0;
++	bool charging = false;
++	if (!battery_status(&percent, &charging)) {
++		return;
++	}
++	if (percent < 0) {
++		percent = 0;
++	} else if (percent > 100) {
++		percent = 100;
++	}
++
++	// Material Design battery glyphs, empty -> full: U+F007A..U+F0082 then
++	// U+F0079 for a full cell. U+F0084 is the charging bolt.
++	static const char *levels[] = {
++		"\xf3\xb0\x81\xba", "\xf3\xb0\x81\xba", "\xf3\xb0\x81\xbb",
++		"\xf3\xb0\x81\xbc", "\xf3\xb0\x81\xbd", "\xf3\xb0\x81\xbe",
++		"\xf3\xb0\x81\xbf", "\xf3\xb0\x82\x80", "\xf3\xb0\x82\x81",
++		"\xf3\xb0\x82\x82", "\xf3\xb0\x81\xb9",
++	};
++	const char *icon = charging ? "\xf3\xb0\x82\x84" : levels[percent / 10];
++
++	const char *in = surface->state->args.batstr;
++	size_t out = 0;
++	while (*in && out + 1 < sizeof(bbuf)) {
++		const char *sub = NULL;
++		char num[8];
++		size_t skip = 0;
++
++		if (strncmp(in, "{p}", 3) == 0) {
++			snprintf(num, sizeof(num), "%d", percent);
++			sub = num;
++			skip = 3;
++		} else if (strncmp(in, "{icon}", 6) == 0) {
++			sub = icon;
++			skip = 6;
++		}
++
++		if (sub) {
++			size_t len = strlen(sub);
++			if (out + len + 1 > sizeof(bbuf)) {
++				break;
++			}
++			memcpy(bbuf + out, sub, len);
++			out += len;
++			in += skip;
++		} else {
++			bbuf[out++] = *in++;
++		}
++	}
++	bbuf[out] = '\0';
++	*bstr = bbuf;
++}
++
++static void timetext(struct swaylock_surface *surface, char **wstr, char **tstr, char **dstr) {
+ 	static char dbuf[256];
+ 	static char tbuf[256];
++	static char wbuf[256];
+ 
+ 	// Use user's locale for strftime calls
+ 	char *prevloc = setlocale(LC_TIME, NULL);
+@@ -51,6 +231,13 @@
+ 	time_t t = time(NULL);
+ 	struct tm *tm = localtime(&t);
+ 
++	if (surface->state->args.weekstr[0]) {
++		strftime(wbuf, sizeof(wbuf), surface->state->args.weekstr, tm);
++		*wstr = wbuf;
++	} else {
++		*wstr = NULL;
++	}
++
+ 	if (surface->state->args.timestr[0]) {
+ 		strftime(tbuf, sizeof(tbuf), surface->state->args.timestr, tm);
+ 		*tstr = tbuf;
+@@ -238,8 +425,10 @@
+ 
+ 		// Draw a message
+ 		char *text = NULL;
++		char *text_l0 = NULL;
+ 		char *text_l1 = NULL;
+ 		char *text_l2 = NULL;
++		char *text_l3 = NULL;
+ 		const char *layout_text = NULL;
+ 		double font_size;
+ 		char attempts[4]; // like i3lock: count no more than 999
+@@ -277,7 +466,8 @@
+ 					text = attempts;
+ 				}
+ 			} else if (state->args.clock) {
+-				timetext(surface, &text_l1, &text_l2);
++				timetext(surface, &text_l0, &text_l1, &text_l2);
++				battext(surface, &text_l3);
+ 			}
+ 
+ 			xkb_layout_index_t num_layout = xkb_keymap_num_layouts(state->xkb.keymap);
+@@ -296,8 +486,10 @@
+ 			}
+ 			break;
+ 		default:
+-			if (state->args.clock)
+-				timetext(surface, &text_l1, &text_l2);
++			if (state->args.clock) {
++				timetext(surface, &text_l0, &text_l1, &text_l2);
++				battext(surface, &text_l3);
++			}
+ 			break;
+ 		}
+ 
+@@ -325,6 +517,84 @@
+ 			if (new_width < extents.width) {
+ 				new_width = extents.width;
+ 			}
++		} else if (text_l0 && text_l1 && text_l2) {
++			// Stacked clock, top to bottom: battery, weekday, time, date.
++			// Positions come from font metrics rather than fixed fractions of
++			// arc_radius, so the stack keeps its spacing at any
++			// --indicator-radius, --font-size or font.
++			cairo_text_extents_t extents;
++			cairo_font_extents_t fe_big, fe_small;
++			double small_size = font_size / 2.0f;
++			double x, y_time, y_week, y_date, gap, shift;
++
++			cairo_font_extents(cairo, &fe_big);
++			cairo_set_font_size(cairo, small_size);
++			cairo_font_extents(cairo, &fe_small);
++
++			gap = small_size / 3.0f;
++
++			// A battery line adds a row above the weekday. Push the block down
++			// by half a row so it stays centred in the ring rather than
++			// riding up out of it.
++			shift = text_l3 ? (fe_small.height + gap) / 2.0f : 0.0f;
++
++			y_time = (buffer_diameter / 2) +
++				(fe_big.height / 2 - fe_big.descent) + shift;
++			y_week = y_time - fe_big.ascent - fe_small.descent - gap;
++			y_date = y_time + fe_big.descent + fe_small.ascent + gap;
++
++			/* Battery -- small, tops the stack. Absent on a desktop. */
++
++			if (text_l3) {
++				cairo_text_extents(cairo, text_l3, &extents);
++				x = (buffer_width / 2) -
++					(extents.width / 2 + extents.x_bearing);
++				cairo_move_to(cairo, x,
++					y_week - fe_small.height - gap);
++				cairo_show_text(cairo, text_l3);
++				cairo_close_path(cairo);
++				cairo_new_sub_path(cairo);
++				if (new_width < extents.width)
++					new_width = extents.width;
++			}
++
++			/* Weekday -- small, sits directly on top of the time. */
++
++			cairo_text_extents(cairo, text_l0, &extents);
++			x = (buffer_width / 2) -
++				(extents.width / 2 + extents.x_bearing);
++			cairo_move_to(cairo, x, y_week);
++			cairo_show_text(cairo, text_l0);
++			cairo_close_path(cairo);
++			cairo_new_sub_path(cairo);
++			if (new_width < extents.width)
++				new_width = extents.width;
++
++			/* Date -- small, sits below the time. */
++
++			cairo_text_extents(cairo, text_l2, &extents);
++			x = (buffer_width / 2) -
++				(extents.width / 2 + extents.x_bearing);
++			cairo_move_to(cairo, x, y_date);
++			cairo_show_text(cairo, text_l2);
++			cairo_close_path(cairo);
++			cairo_new_sub_path(cairo);
++			if (new_width < extents.width)
++				new_width = extents.width;
++
++			/* Time -- full size, vertically centred in the ring. */
++
++			cairo_set_font_size(cairo, font_size);
++			cairo_text_extents(cairo, text_l1, &extents);
++			x = (buffer_width / 2) -
++				(extents.width / 2 + extents.x_bearing);
++			cairo_move_to(cairo, x, y_time);
++			cairo_show_text(cairo, text_l1);
++			cairo_close_path(cairo);
++			cairo_new_sub_path(cairo);
++			if (new_width < extents.width)
++				new_width = extents.width;
++
+ 		} else if (text_l1 && text_l2) {
+ 			cairo_text_extents_t extents_l1, extents_l2;
+ 			cairo_font_extents_t fe_l1, fe_l2;
