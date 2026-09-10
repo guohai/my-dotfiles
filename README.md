@@ -52,7 +52,7 @@ Everything below is declared in `nixos/configuration.nix` — there is nothing t
 
 | | |
 | --- | --- |
-| **grim + slurp + satty** | Region select → screenshot → annotate. |
+| **grim + slurp + satty** | Screenshots. `⌘+Shift+3` whole screen, `⌘+Shift+4` drag a region — both open satty to annotate, then copy to the clipboard and save to `~/Pictures/Screenshots/`. niri's own `Print` / `Ctrl+Print` / `Alt+Print` are also bound — picker / whole screen / focused window, saved straight to disk with no annotation step — but an Apple keyboard has no Print key. |
 | **kooha** | Screen recording. |
 | **ffmpeg-full** | Full ffmpeg with every codec and filter enabled. |
 | **playerctl** | Media keys (play/pause/next) against MPRIS. |
@@ -118,19 +118,67 @@ Never copy someone else's.
 
 ## Restoring on a new machine
 
+### 0. Install NixOS itself — from the **minimal** ISO, with no desktop
+
+Download the **Minimal ISO image** from [nixos.org/download](https://nixos.org/download/),
+not the GNOME or Plasma graphical one. Match the release to this config:
+`system.stateVersion` here is **26.05**, and home-manager is pinned to
+`release-26.05`, so nixpkgs has to be the 26.05 channel or the two will not agree.
+
+Three reasons the graphical installer is the wrong starting point:
+
+- **Its work gets thrown away.** Calamares writes its own
+  `/etc/nixos/configuration.nix` with `services.desktopManager.gnome` and GDM in
+  it. Step 3 below overwrites that file wholesale. You will have downloaded and
+  built an entire GNOME desktop that never runs again, and it sits in the Nix
+  store until you `nix-collect-garbage -d`.
+- **This config brings its own login screen.** `services.greetd` + tuigreet
+  launches `niri-session` from a TTY. A second display manager is not a conflict
+  you have to resolve — it just should never have been installed.
+- **The minimal ISO drops you exactly where the rest of this README expects
+  you.** Steps 1–5 are all TTY work, and greetd is a TTY login. There is no
+  point in the install being graphical when the finished system's first screen
+  is text.
+
+The short version of a minimal install (read the
+[NixOS manual](https://nixos.org/manual/nixos/stable/#sec-installation) for
+partitioning — it is machine-specific and easy to get wrong):
+
 ```bash
-git clone https://github.com/guohai/my-dotfiles ~/my-dotfiles
+# ...partition and format, then mount the root at /mnt...
+sudo nixos-generate-config --root /mnt
+sudo nixos-install                 # prompts for a root password
+reboot
+```
+
+Log in as **root** on the TTY after the reboot. Your own account does not exist
+yet — it gets created by step 3, and even then without a password (see the note
+there). Wifi on a minimal system is `nmtui` or `nmcli`. `git` is on the installer
+image but *not* on the system you just installed, so the clone below borrows it
+from a temporary shell.
+
+### 1. Clone this repo and generate your hardware config
+
+```bash
+nix-shell -p git --run 'git clone https://github.com/guohai/my-dotfiles ~/my-dotfiles'
 cd ~/my-dotfiles
 ```
 
-**1. Generate your own hardware config** (do not skip this):
+`--run` matters: a bare `nix-shell -p git` opens an interactive subshell, so the
+lines pasted after it would not execute until you exit it.
+
+**Generate your own hardware config** (do not skip this):
 
 ```bash
 sudo nixos-generate-config
 ```
 
+If you came from step 0, `nixos-install` already wrote this file and you can skip
+the command — it is here for the other path, applying this repo to a NixOS
+machine you already have.
+
 `configuration.nix` imports `./hardware-configuration.nix`, which is not in this
-repo on purpose. If you skip this step the very first build fails with:
+repo on purpose. If it is missing, the very first build fails with:
 
 ```
 error: path '.../hardware-configuration.nix' does not exist
@@ -139,8 +187,10 @@ error: path '.../hardware-configuration.nix' does not exist
 That is expected, not a broken repo. `nixos-generate-config` writes the file to
 `/etc/nixos/`, which is where step 3 puts everything else.
 
-**2. Read the portability header** at the top of `nixos/configuration.nix` and
-edit what applies to you. Every machine-specific line is also marked inline:
+### 2. Read the portability header
+
+At the top of `nixos/configuration.nix` — edit what applies to you. Every
+machine-specific line is also marked inline:
 
 ```bash
 grep -n 'PORTABILITY:' nixos/configuration.nix
@@ -150,7 +200,7 @@ At minimum you will want to change the **username** (it is `brent` in this repo)
 the **timezone**, and delete the **FaceTime HD camera** block unless you are also
 on an Intel Mac.
 
-**3. Install:**
+### 3. Install the system — as root
 
 ```bash
 # Everything under nixos/pkgs/ is referenced by configuration.nix as a
@@ -161,15 +211,6 @@ sudo mkdir -p /etc/nixos/pkgs
 sudo cp nixos/configuration.nix /etc/nixos/configuration.nix
 sudo cp nixos/pkgs/*            /etc/nixos/pkgs/
 
-# These three are NOT deployed by configuration.nix -- it does not manage
-# them, by design (see "Quickshell's shell.qml lives outside the Nix store"
-# below). Skip this and you get a working system with no bar, no keybinds
-# and no Mac key layer.
-mkdir -p ~/.config/niri ~/.config/quickshell ~/.config/xremap
-cp config/niri/config.kdl      ~/.config/niri/
-cp config/quickshell/shell.qml ~/.config/quickshell/
-cp config/xremap/config.yml    ~/.config/xremap/
-
 sudo nixos-rebuild switch
 
 # The account is created without a password. Set one before logging out, or
@@ -177,10 +218,40 @@ sudo nixos-rebuild switch
 sudo passwd YOURNAME
 ```
 
-**4. Log out and back in.** The `input` and `uinput` group memberships, the new
-user services, and the session environment variables only take effect on a
-fresh session. If you kept the camera block, you need a full **reboot** instead
-(it loads a new kernel module).
+This is the step that creates your user account, so nothing before it can be
+done *as* that user.
+
+### 4. Deploy the three hand-managed configs — as your own user
+
+Log out of root and log in as `YOURNAME` on the TTY. **Do not run these as
+root**: `~` is `/root` there, and the files would land in root's home where
+niri, Quickshell and xremap will never look for them. The symptom is a system
+that boots to a working desktop with no bar, no keybinds and no Mac key layer,
+with nothing in any log to explain it.
+
+```bash
+# If you cloned into /root in step 1, you cannot reach it from here -- /root is
+# mode 0700. Either hand it over while still root:
+#     mv /root/my-dotfiles /home/YOURNAME/ && chown -R YOURNAME: /home/YOURNAME/my-dotfiles
+# or just clone it again now, as yourself. git is on the system after step 3.
+cd ~/my-dotfiles
+
+# These three are NOT deployed by configuration.nix -- it does not manage
+# them, by design (see "Quickshell's shell.qml lives outside the Nix store"
+# below).
+mkdir -p ~/.config/niri ~/.config/quickshell ~/.config/xremap
+cp config/niri/config.kdl      ~/.config/niri/
+cp config/quickshell/shell.qml ~/.config/quickshell/
+cp config/xremap/config.yml    ~/.config/xremap/
+```
+
+### 5. Reboot
+
+The `input` and `uinput` group memberships, the new user services, and the
+session environment variables all need a fresh session; the camera block, if you
+kept it, needs a new kernel module. Logging out and back in covers the first
+group, but on a first install from step 0 you may as well reboot and let greetd
+give you the real login screen.
 
 Any pre-existing `kitty.conf` / `foot.ini` / `config.fish` will be renamed to
 `.hm-bak` by home-manager on first activation rather than overwritten.
