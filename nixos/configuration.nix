@@ -220,13 +220,63 @@ let
     # sleep was reporting failure routinely, which would bury a genuine
     # failure in noise. Exiting 0 when a locker already owns the session is
     # the correct answer to "make sure the screen is locked".
-    if ${pkgs.procps}/bin/pgrep -x swaylock >/dev/null 2>&1; then
-      exit 0
-    fi
+    #
+    # That intent was right; the old implementation of it was not. This used to
+    # open with a `pgrep -x swaylock && exit 0` pre-flight check, which asks
+    # "is a swaylock process alive?" -- a different question from "is the
+    # session already locked?". A live swaylock is in one of three states:
+    # holding the lock, still starting up, or exiting after an unlock. Only the
+    # first makes `exit 0` correct. In the other two the wrapper reported
+    # success to swayidle's before-sleep without anything ever locking,
+    # swayidle then released logind's sleep inhibitor, and the machine
+    # suspended with the desktop still on screen. The journal caught one: lid
+    # closed 08:37:11, no "locking session" line at all, lid reopened 5.7s
+    # later onto a live unlocked session.
+    #
+    # So ask the compositor instead of guessing from a process name. niri
+    # refusing the lock IS the authoritative "already locked" answer, and
+    # swaylock surfaces it with a known message and a non-zero exit -- both
+    # handled at the bottom of this script. Same quiet logs, no false success.
 
     images=(${lib.concatStringsSep " " (map (w: "${w}") lockWallpapersBlurred)})
     # $RANDOM is bash's, and this script runs under bash via writeShellScriptBin.
     pick="''${images[$((RANDOM % ''${#images[@]}))]}"
+
+    # Absolute paths throughout the rest of this script, never bare `date`,
+    # `mktemp`, `cat`, `grep`. swayidle invokes this wrapper with a PATH of one
+    # single entry -- bash-interactive/bin -- with no coreutils on it at all.
+    # A bare builtin-shadowed name fails with "command not found" on stderr and
+    # nothing else, which is how `rm` in kbd-backlight-inhibit stayed broken
+    # through every lid cycle without anyone noticing.
+    log() {
+      printf '%s lock-screen: %s\n' \
+        "$(${pkgs.coreutils}/bin/date '+%H:%M:%S.%3N')" "$1" >&2
+    }
+
+    # Timestamps, because the interesting failures here are latency failures.
+    # Measured locks have taken anywhere from 0.24s to 7.78s between this
+    # script starting and niri logging "locking session". That matters beyond
+    # tidiness: `-f` returns once the lock is *acquired*, not once swaylock has
+    # *painted*, so a slow lock lets the machine suspend while the pre-lock
+    # desktop is still the last frame scanned out -- and that stale frame is
+    # what the panel shows on resume until swaylock finally draws. Without
+    # these two lines that is only diagnosable by correlating niri's log
+    # against systemd-logind's by hand.
+    log "launching swaylock"
+
+    # swaylock's stderr is captured rather than inherited so the bottom of this
+    # script can tell a refusal apart from a real failure. Trade-off, worth
+    # knowing: with -f (swayidle's three call sites) swaylock daemonizes
+    # immediately and this costs nothing, but the Super+Ctrl+Q keybind passes
+    # no -f, so there swaylock blocks and its stderr reaches the journal at
+    # unlock rather than live. Nothing is lost by that -- swaylock is silent in
+    # a normal session, and failed password attempts are logged by PAM
+    # ("pam_unix(swaylock:auth): authentication failure"), a separate channel
+    # this does not touch.
+    err=$(${pkgs.coreutils}/bin/mktemp)
+    trap '${pkgs.coreutils}/bin/rm -f "$err"' EXIT
+
+    status=0
 
     # No --effect-blur: these images are already blurred, in the store, at
     # panel resolution. See the `preblur` comment above for why.
@@ -250,9 +300,10 @@ let
     # Do NOT put comments between the flags below. Every line here ends in a
     # backslash, so a `#` does not start a comment on its own line -- it eats
     # the rest of the joined line and terminates the command early. Doing that
-    # silently drops every flag after it, and since this is `exec`, nothing
-    # complains: you just get a lock screen with the wrong colours.
-    exec ${swaylockPkg}/bin/swaylock \
+    # silently drops every flag after it, and swaylock still exits 0, so the
+    # status check below will not catch it either: you just get a lock screen
+    # with the wrong colours.
+    ${swaylockPkg}/bin/swaylock \
       --image "$pick" \
       --scaling fill \
       --effect-vignette 0.4:0.4 \
@@ -282,7 +333,41 @@ let
       --text-wrong-color f38ba8 \
       --line-color 00000000 \
       --separator-color 00000000 \
-      "$@"
+      "$@" 2>"$err" || status=$?
+
+    if [ "$status" -eq 0 ]; then
+      if [ -s "$err" ]; then ${pkgs.coreutils}/bin/cat "$err" >&2; fi
+      log "swaylock exited 0"
+      exit 0
+    fi
+
+    # A locker already owns the session. That is not a failure of "make sure
+    # the screen is locked" -- it is already true -- so report success, and
+    # deliberately do NOT echo $err while doing it. This message is precisely
+    # the routine before-sleep noise the old pgrep pre-check existed to
+    # suppress, and it is expected on the common path.
+    #
+    # Two distinct messages mean this, and swaylock picks between them by how
+    # far it got before the compositor said no:
+    #   "Failed to lock session -- is another lockscreen running?"
+    #   "Exiting - failed to inhibit input: is another lockscreen already running?"
+    # Both were read out of the swaylock-effects 1.7.0.0 binary, so the pattern
+    # below is matched against the real strings rather than a guess. If a
+    # future swaylock reworks its wording this stops recognising a refusal and
+    # starts reporting it as a genuine failure -- noisy, but it fails loud
+    # rather than silently claiming a lock that never happened, which is the
+    # direction this whole change is meant to err in.
+    if ${pkgs.gnugrep}/bin/grep -qE "another lockscreen (already )?running" "$err"; then
+      log "session already locked by another client, nothing to do"
+      exit 0
+    fi
+
+    # Anything else is real. Surface it and propagate the status, so a lock
+    # that genuinely could not happen is visible to swayidle instead of being
+    # rounded up to success.
+    if [ -s "$err" ]; then ${pkgs.coreutils}/bin/cat "$err" >&2; fi
+    log "swaylock FAILED with status $status -- session may be unlocked"
+    exit "$status"
   '';
 
   # Bring the panel back and hand the keyboard back to the light sensor.
@@ -323,7 +408,12 @@ let
         break
       fi
       i=$((i + 1))
-      sleep 0.2
+      # Absolute path: swayidle's PATH is bash-interactive/bin and nothing
+      # else, so bare `sleep` is not found. That would not have thrown an
+      # error loud enough to notice -- the loop would just spin 25 times in
+      # microseconds and give up instantly, turning a 5s retry window into no
+      # retry at all. See the identical fix in kbd-backlight-inhibit.
+      ${pkgs.coreutils}/bin/sleep 0.2
     done
 
     # Cleared unconditionally on the way out. If niri never answered, the
@@ -1069,6 +1159,23 @@ in
     # ~/.config/gh/hosts.yml in plaintext. That path is outside this repo, but
     # it is worth knowing about before backing up ~/.config wholesale.
     gh
+    # Second coding agent alongside claude-code. Same reasoning for putting it
+    # system-wide rather than npm -g: the Nix store is read-only, so its
+    # self-update is inert and upgrading means bumping the channel and
+    # rebuilding. Auth state lands in ~/.codex/, outside this repo.
+    codex
+    # Editor. Deliberately not wired to $EDITOR here -- nothing in this config
+    # sets that, and changing it would silently redirect git, systemctl edit
+    # and visudo for every account at once. Set it per-user if wanted.
+    neovim
+    # For `strings`, plus objdump/nm/readelf. Pulled in after debugging a
+    # swaylock issue stalled on `strings` not existing: the invocation had its
+    # stderr redirected to /dev/null, so a missing binary looked exactly like a
+    # binary with no matching strings in it, and sent the search down a dead
+    # end. This is the wrapped binutils, so it also puts ld/as on PATH; that
+    # does not affect Nix builds, which run sandboxed without systemPackages.
+    # Use binutils-unwrapped instead if the bare linker on PATH is unwanted.
+    binutils
     google-chrome
     fuzzel
     wl-clipboard

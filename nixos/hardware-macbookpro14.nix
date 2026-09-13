@@ -110,7 +110,15 @@ let
         }
         ;;
       off)
-        rm -f "$FLAG"
+        # Absolute path, not bare `rm`. This script's main caller is swayidle,
+        # whose PATH is a single entry -- bash-interactive/bin -- with no
+        # coreutils in it. Bare `rm` therefore failed with "rm: command not
+        # found" on every single unblank, so the flag went up and never came
+        # back down, and the backlight daemon held the keyboard at 0 forever.
+        # `: > "$FLAG"` in the `on` branch is a shell builtin and a redirect,
+        # so it kept working -- which is exactly why the failure was one-sided
+        # and looked like a stuck inhibit rather than a broken script.
+        ${pkgs.coreutils}/bin/rm -f "$FLAG"
         ;;
       *)
         echo "usage: kbd-backlight-inhibit on|off" >&2
