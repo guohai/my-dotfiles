@@ -453,7 +453,10 @@ ShellRoot {
 
                 MouseArea {
                     anchors.fill: parent
-                    onClicked: root.openPanel = root.openPanel === "clock" ? "" : "clock"
+                    // onPressed for the same reason as the wifi cell: an open
+                    // wifi picker holds the keyboard, and pressing any bar cell
+                    // cancels the pointer grab before onClicked can fire.
+                    onPressed: root.openPanel = root.openPanel === "clock" ? "" : "clock"
                 }
             }
 
@@ -515,7 +518,14 @@ ShellRoot {
                     MouseArea {
                         anchors.fill: parent
                         acceptedButtons: Qt.LeftButton | Qt.RightButton
-                        onClicked: mouse => {
+                        // onPressed for the same reason as the wifi cell: an
+                        // open wifi picker holds the keyboard, and pressing any
+                        // bar cell cancels the pointer grab before onClicked
+                        // can fire. Mute is on the same handler so both buttons
+                        // behave alike -- a mute that needed two clicks only
+                        // while the wifi panel happened to be open would be a
+                        // far stranger bug to be told about than this one.
+                        onPressed: mouse => {
                             if (mouse.button === Qt.RightButton)
                                 root.openPanel = root.openPanel === "audio" ? "" : "audio";
                             else if (audio.sink?.audio)
@@ -550,7 +560,32 @@ ShellRoot {
 
                     MouseArea {
                         anchors.fill: parent
-                        onClicked: root.openPanel = root.openPanel === "wifi" ? "" : "wifi"
+                        // onPressed, not onClicked, and this is the cell where
+                        // the reason lives -- the other three copy it.
+                        //
+                        // onClicked needs the press and the release to land on
+                        // the same item. The wifi picker is the only surface
+                        // here that asks for keyboard interactivity
+                        // (WlrKeyboardFocus.OnDemand, which its passphrase
+                        // field cannot do without), so while it is open it
+                        // holds the keyboard. Pressing any bar cell makes the
+                        // compositor move focus off it, Qt cancels the
+                        // in-flight pointer grab, and onClicked never fires.
+                        //
+                        // Measured, not guessed: with onClicked the log showed
+                        //   09:50:43.554  wifi PRESS  openPanel='wifi'
+                        //   09:50:43.557  wifi CANCELED
+                        // 3.3ms apart, no release, panel left open -- and the
+                        // next press a second later worked. That is the "takes
+                        // two clicks to close the wifi panel" report, and it
+                        // hits whichever cell you press while wifi is open, not
+                        // just this one.
+                        //
+                        // The press itself is always delivered; only the grab
+                        // that follows it is at risk. So toggling on press is
+                        // immune to this regardless of what cancels the grab.
+                        // The click-away catcher already works this way.
+                        onPressed: root.openPanel = root.openPanel === "wifi" ? "" : "wifi"
                     }
                 }
 
@@ -593,7 +628,11 @@ ShellRoot {
 
                     MouseArea {
                         anchors.fill: parent
-                        onClicked: root.openPanel = root.openPanel === "bt" ? "" : "bt"
+                        // onPressed for the same reason as the wifi cell: an
+                        // open wifi picker holds the keyboard, and pressing any
+                        // bar cell cancels the pointer grab before onClicked
+                        // can fire.
+                        onPressed: root.openPanel = root.openPanel === "bt" ? "" : "bt"
                     }
                 }
 
@@ -708,25 +747,39 @@ ShellRoot {
     // Click-away catcher. A transparent full-screen surface that closes
     // whichever picker is open when a click lands outside it.
     //
-    // Declared before the four pickers deliberately. Layer-shell surfaces
-    // within one layer stack in the order the compositor learns about them, and
-    // Quickshell creates them in declaration order, so this ends up underneath
-    // them. Were it on top, every click would hit the catcher first and the
-    // pickers themselves would become unclickable -- the panel would shut the
-    // instant you reached for a device in it.
+    // On WlrLayer.Top while the pickers are on Overlay, which is what keeps it
+    // underneath them. Layer-shell orders its four layers strictly
+    // (Background < Bottom < Top < Overlay), so this is guaranteed by the
+    // protocol and needs no cooperation from the compositor.
     //
-    // Starts below the bar rather than covering it. The bar sits on
-    // WlrLayer.Top and this is on Overlay, so a full-height catcher would
-    // swallow clicks on the very cells that switch between pickers: clicking
-    // wifi while bluetooth is open has to reach the wifi cell, which sets
-    // openPanel to "wifi" and swaps them in one click. Left uncovered, that
-    // keeps working untouched.
+    // It used to sit on Overlay too, with the pickers, resting on the theory
+    // that "surfaces within one layer stack in the order the compositor learns
+    // about them, and Quickshell creates them in declaration order, so
+    // declaring the catcher first puts it underneath". That does not hold.
+    // This catcher and a picker both become visible from the same
+    // root.openPanel change, so both surfaces get mapped in one pass with
+    // nothing ordering them against each other -- and in practice the catcher
+    // came out on top. It then swallowed every press aimed at a picker, so
+    // clicking a network or a device closed the panel instead of selecting
+    // anything: the pickers were entirely unclickable. Declaration order is
+    // not a stacking guarantee; layer assignment is.
+    //
+    // Top still sits above ordinary toplevel windows, so it catches clicks
+    // anywhere on the desktop, which is the whole job.
+    //
+    // Starts below the bar rather than covering it. The bar is on Top as well,
+    // but the two never overlap -- the bar is the first 32px and this begins
+    // at 32 -- so sharing a layer with it introduces no ambiguity of its own.
+    // Covering it would swallow clicks on the very cells that switch between
+    // pickers: clicking wifi while bluetooth is open has to reach the wifi
+    // cell, which sets openPanel to "wifi" and swaps them in one click. Left
+    // uncovered, that keeps working untouched.
     //
     // keyboardFocus None so the surface never takes focus from the window
     // underneath; it only exists to catch a pointer press.
     PanelWindow {
         visible: root.openPanel !== ""
-        WlrLayershell.layer: WlrLayer.Overlay
+        WlrLayershell.layer: WlrLayer.Top
         WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
         exclusionMode: ExclusionMode.Ignore
         color: "transparent"
