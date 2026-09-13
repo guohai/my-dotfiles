@@ -285,6 +285,54 @@ let
       "$@"
   '';
 
+  # Bring the panel back and hand the keyboard back to the light sensor.
+  #
+  # This exists because the obvious one-liner was wrong. The swayidle resume
+  # hook used to be, literally:
+  #
+  #   niri msg action power-on-monitors; kbd-backlight-inhibit off
+  #
+  # and `;` runs the second command whatever the first one did. Right after a
+  # resume the compositor is not always answering on its socket yet -- the
+  # applespi rebind tears down and recreates the keyboard and touchpad about
+  # 2.5s in, and `niri msg` during that window can fail or land on nothing. So
+  # the power-on silently did not happen, the inhibit clear did, and the
+  # machine came back with a dark screen and a lit keyboard. That exact pair
+  # is the symptom that sent me looking.
+  #
+  # The recovery was worse than the fault. swayidle fires a `resume` command
+  # only on an idle -> active edge, and that edge had just been spent. Nothing
+  # would retry until the 330s blank timer fired again and the user touched
+  # the trackpad a second time -- so the screen stayed black for five and a
+  # half minutes, which is precisely the "several minutes" in the report.
+  #
+  # Hence: retry the power-on until it takes, and only then release the
+  # keyboard. Ordering is deliberate -- if the screen cannot be revived, the
+  # keyboard stays dark rather than lighting up under a black panel and
+  # advertising that something is broken.
+  wakeDisplays = pkgs.writeShellScriptBin "wake-displays" ''
+    set -u
+
+    # ~5s of trying, which comfortably covers the applespi rebind window.
+    # Each attempt is cheap and idempotent: powering on an already-on output
+    # is a no-op, so over-calling costs nothing and under-calling costs the
+    # five-minute blackout described above.
+    i=0
+    while [ "$i" -lt 25 ]; do
+      if ${pkgs.niri}/bin/niri msg action power-on-monitors 2>/dev/null; then
+        break
+      fi
+      i=$((i + 1))
+      sleep 0.2
+    done
+
+    # Cleared unconditionally on the way out. If niri never answered, the
+    # screen is a lost cause for this cycle, but leaving a stale inhibit file
+    # behind would wedge the keyboard dark until the next blank/wake cycle --
+    # trading one stuck state for another.
+    /run/current-system/sw/bin/kbd-backlight-inhibit off || true
+  '';
+
   # One command behind both recording binds (config.kdl Super+Shift+5 and
   # Super+Ctrl+Shift+5). It is a *toggle*: the same chord that starts a
   # recording stops it, so there is nothing to remember and no second key to
@@ -852,7 +900,7 @@ in
           {
             timeout = 330;
             command = "${pkgs.niri}/bin/niri msg action power-off-monitors; /run/current-system/sw/bin/kbd-backlight-inhibit on";
-            resumeCommand = "${pkgs.niri}/bin/niri msg action power-on-monitors; /run/current-system/sw/bin/kbd-backlight-inhibit off";
+            resumeCommand = "${wakeDisplays}/bin/wake-displays";
           }
           # Auto-suspend at 900s. This was DISABLED for a while, and the story
           # is worth keeping because it explains three other settings in this
@@ -896,6 +944,18 @@ in
           # Lock *before* the machine sleeps, not after it wakes -- otherwise
           # the desktop is briefly visible on resume before the locker appears.
           before-sleep = "${lockCmd}/bin/lock-screen -f";
+
+          # The belt to the resume hook's braces, and the more reliable of the
+          # two. This fires on logind's PrepareForSleep(false) -- every single
+          # resume, unconditionally -- whereas the 330s timer's resumeCommand
+          # fires only on an idle -> active edge, and only if that timer had
+          # actually elapsed. The failure being fixed here is precisely the
+          # case where that edge is spent or never arrives, so relying on it
+          # alone is what created the five-minute black screen.
+          #
+          # Running both is fine: wake-displays is idempotent, and powering on
+          # a live output does nothing.
+          after-resume = "${wakeDisplays}/bin/wake-displays";
 
           # logind's Lock signal. logind never locks anything itself -- it just
           # announces the intent on the session bus and expects a listener.

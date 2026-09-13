@@ -202,6 +202,12 @@ let
     last_written=""
     override_band=""
 
+    # Set for as long as one screen-blank episode lasts. Distinguishes the
+    # first tick of a blank (dim whatever is lit) from every tick after it
+    # (anything lit must have come from the user's hand). See the inhibit
+    # block below.
+    inhibited=""
+
     while :; do
       # The LED node is destroyed and recreated by applespi-rebind-resume on
       # every wake, so finding it missing is normal here and not an error worth
@@ -220,30 +226,68 @@ let
       #
       # Set by swayidle at the moment it powers the monitors down and cleared
       # when they come back; see services.swayidle in configuration.nix.
-      if [ -e "$INHIBIT" ]; then
+      if [ ! -e "$INHIBIT" ]; then
+        # Not inhibited. Reset the episode marker so the next blank starts
+        # from its first tick again -- without this, a second blank would go
+        # straight to the "user raised it" branch below and mistake the
+        # pre-blank level for a deliberate keypress.
+        inhibited=""
+      else
         held=""
         { read -r held < "$LED"; } 2>/dev/null || held=""
-        if [ "$held" != "0" ]; then
-          printf '0\n' > "$LED" 2>/dev/null || true
+
+        if [ -z "$inhibited" ]; then
+          # First tick of this blank. Whatever is lit now is left over from
+          # before the screen went down, not a request, so put it out.
+          if [ "$held" != "0" ]; then
+            printf '0\n' > "$LED" 2>/dev/null || true
+          fi
+          inhibited=1
+          last_written=0
+
+          # Forget where we were. Two reasons: the screen coming back should
+          # ramp up from off rather than snap to the old level, and a manual
+          # override from before the screen blanked should not outlive it --
+          # by the time you are back, "I turned it down ten minutes ago" is
+          # not a preference worth preserving.
+          cur=$NBANDS
+          override_band=""
+
+          # Poll quickly here, despite the screen being off and this looking
+          # like exactly the moment to idle. It bounds how long the keyboard
+          # stays dark after you touch the trackpad, and the window is
+          # inherently short: the 900s idle timer suspends the machine about
+          # nine minutes after the monitors go down, so this cannot run long
+          # enough for the extra wakeups to matter.
+          sleep "$POLL_FAST"
+          continue
         fi
-        last_written=0
 
-        # Forget where we were. Two reasons: the screen coming back should ramp
-        # up from off rather than snap to the old level, and a manual override
-        # from before the screen blanked should not outlive it -- by the time
-        # you are back, "I turned it down ten minutes ago" is not a preference
-        # worth preserving.
-        cur=$NBANDS
-        override_band=""
+        if [ "$held" = "0" ]; then
+          # Still dark, still blanked. Nothing to do.
+          sleep "$POLL_FAST"
+          continue
+        fi
 
-        # Poll quickly here, despite the screen being off and this looking like
-        # exactly the moment to idle. It bounds how long the keyboard stays
-        # dark after you touch the trackpad, and the window is inherently
-        # short: the 900s idle timer suspends the machine about nine minutes
-        # after the monitors go down, so this cannot run long enough for the
-        # extra wakeups to matter.
-        sleep "$POLL_FAST"
-        continue
+        # We already drove this to 0 on an earlier tick of the same blank, and
+        # it is lit again. Nothing else writes this node, so a hand did it --
+        # F6, almost certainly. A deliberate keypress outranks the blank, so
+        # drop the inhibit and fall through to the normal path, where the
+        # override check below sees held != last_written and settles on the
+        # user's value.
+        #
+        # This is the fix for a genuinely awful failure mode. Previously the
+        # inhibit won unconditionally, so F6 lit the keyboard and this loop
+        # stamped it back to 0 within one poll -- "on for a second, then off",
+        # forever, with nothing on screen to explain why. Worse, a stale flag
+        # file (swayidle missing a resume, say) disabled manual control
+        # permanently with no way for the user to discover the cause.
+        #
+        # Removing the file rather than just ignoring it matters: swayidle
+        # only clears it on an idle -> active edge, and if that edge never
+        # arrives the flag would otherwise outlive the blank entirely.
+        rm -f "$INHIBIT" 2>/dev/null || true
+        inhibited=""
       fi
 
       # `read < file` is a builtin plus a redirect -- no process. The braces and
