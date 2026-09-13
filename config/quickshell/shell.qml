@@ -78,6 +78,16 @@ ShellRoot {
         return "▁▃▅▇".substring(0, n) + "    ".substring(0, 4 - n);
     }
 
+    // Status labels in the pickers read as standalone fragments -- "On",
+    // "Locked", "Paired" -- so they carry a leading capital. Most are literals
+    // below and could just be typed that way, but ConnectionState.toString()
+    // hands back lowercase from the service module, so at least one of them
+    // has to be capitalised at runtime. Doing all of them through one helper
+    // keeps the transient states matching the settled ones.
+    function cap(s) {
+        return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+    }
+
     // ---- system stats ---------------------------------------------------
     // Quickshell has no cpu/mem/disk module; these come from /proc via
     // FileView. procfs does not emit inotify events, so watchChanges would
@@ -208,9 +218,28 @@ ShellRoot {
         readonly property var dev: Networking.devices.values.find(d => d.type === DeviceType.Wifi) ?? null
         readonly property var active: dev ? dev.networks.values.find(n => n.connected) ?? null : null
 
-        // Connected first, then strongest. Copy before sorting: .values hands
-        // back the live model array and sort() would reorder it in place.
-        readonly property var list: dev ? dev.networks.values.slice().sort((a, b) => (b.connected - a.connected) || (b.signalStrength - a.signalStrength)) : []
+        // Signal floor for the list below. bars() buckets signalStrength with
+        // ceil(strength * 4), so it draws 3 bars once strength * 4 exceeds 2 --
+        // "at least 3 bars" is strength > 2/4. Written as 2 / 4 rather than 0.5
+        // to keep the 4 of the four-bar meter visible at a glance.
+        readonly property real floor: 2 / 4
+
+        // Connected first, then strongest, and only what is worth clicking.
+        // filter() already returns a fresh array, so the old .slice() is gone --
+        // it was there because .values hands back the live model array and
+        // sort() would reorder it in place.
+        //
+        // The connected network is exempt from the floor. Dropping it when you
+        // walk to the far end of the flat would leave the picker with nothing
+        // to say about the connection you are actually on, and no way to click
+        // it to disconnect.
+        readonly property var list: dev ? dev.networks.values.filter(n => n.connected || n.signalStrength > net.floor).sort((a, b) => (b.connected - a.connected) || (b.signalStrength - a.signalStrength)) : []
+
+        // Hidden, not silently dropped -- same reasoning as the "N unnamed"
+        // count on the bluetooth scan row. Without this, a scan in a weak spot
+        // comes back with an empty list and looks like a dead radio, when in
+        // fact it found a dozen APs and none of them cleared 3 bars.
+        readonly property int weak: dev ? dev.networks.values.length - net.list.length : 0
 
         // Network awaiting a passphrase, or null. Set either by clicking an
         // unknown secured network or by a NoSecrets failure.
@@ -950,7 +979,7 @@ ShellRoot {
                     color: !Networking.wifiHardwareEnabled ? root.bad : Networking.wifiEnabled ? root.accent : root.dim
                     font.family: root.mono
                     font.pixelSize: 11
-                    text: !Networking.wifiHardwareEnabled ? "blocked by hardware switch" : Networking.wifiEnabled ? "on" : "off"
+                    text: !Networking.wifiHardwareEnabled ? "Blocked by hardware switch" : Networking.wifiEnabled ? "On" : "Off"
                 }
             }
 
@@ -1016,12 +1045,12 @@ ShellRoot {
                         text: {
                             const n = netRow.modelData;
                             if (n.stateChanging)
-                                return ConnectionState.toString(n.state) + "...";
+                                return root.cap(ConnectionState.toString(n.state)) + "...";
                             if (n.connected)
-                                return "connected";
+                                return "Connected";
                             if (n.known)
-                                return "saved";
-                            return n.security === WifiSecurityType.Open ? "open" : "locked";
+                                return "Saved";
+                            return n.security === WifiSecurityType.Open ? "Open" : "Locked";
                         }
                     }
                 }
@@ -1090,11 +1119,59 @@ ShellRoot {
                 text: net.error
             }
 
+            PickerRow {
+                width: wifiCol.width
+                onActivated: {
+                    netManagerProc.running = true;
+                    root.openPanel = "";
+                }
+
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.left: parent.left
+                    anchors.leftMargin: 6
+                    color: root.dim
+                    font.family: root.mono
+                    font.pixelSize: 12
+                    // No leading indent, unlike the other launcher rows: this
+                    // sits flush with the signal meter in the network rows
+                    // above. Same leftMargin and same 12px mono as sigText, so
+                    // the "O" lands exactly on the first bar glyph.
+                    text: "Open nmtui (hidden SSIDs, static IP, VPN)..."
+                }
+            }
+
             PickerHeading {
                 width: wifiCol.width
                 wrapMode: Text.Wrap
-                text: net.dev ? "Scanning on " + net.dev.name + " -- right-click a saved network to forget it" : "Waiting for NetworkManager..."
+                text: net.dev
+                    ? "Scanning on " + net.dev.name
+                        + (net.weak > 0 ? " -- " + net.weak + " below 3 bars hidden" : "")
+                        + " -- right-click a saved network to forget it"
+                    : "Waiting for NetworkManager..."
             }
+        }
+
+        Process {
+            id: netManagerProc
+            // The wifi counterpart to the bluetui row in the bluetooth picker:
+            // everything the picker above does not cover -- hidden SSIDs, static
+            // addressing, 802.1X, editing a saved connection rather than just
+            // forgetting it.
+            //
+            // nmtui rather than a GUI because there is no good GUI to pick. The
+            // two genuinely nice ones, iwgtk and impala, both talk to iwd, and
+            // NetworkManager here is on its default wpa_supplicant backend.
+            // Switching it is not worth doing on this machine: wlp2s0 is
+            // brcmfmac, a fullmac driver that leaves scanning and roaming to
+            // Broadcom firmware, which is exactly the arrangement iwd expects to
+            // drive itself. That leaves nm-connection-editor, which is uglier
+            // than the thing it would replace, or gnome-control-center, which
+            // means GNOME. nmtui ships with NetworkManager, is already on PATH,
+            // and inherits the terminal palette.
+            //
+            // kitty and --class for the same reasons as btManagerProc below.
+            command: ["kitty", "--class", "nmtui", "-e", "nmtui"]
         }
     }
 
@@ -1155,7 +1232,7 @@ ShellRoot {
                     font.pixelSize: 11
                     // No adapter at all means bluez is not on the bus, which is
                     // a different problem from the adapter being powered down.
-                    text: !bt.adapter ? "bluez not running" : bt.adapter.enabled ? "on" : "off"
+                    text: !bt.adapter ? "BlueZ not running" : bt.adapter.enabled ? "On" : "Off"
                 }
             }
 
@@ -1182,7 +1259,14 @@ ShellRoot {
                         color: btRow.modelData.connected ? root.accent : root.fg
                         font.family: root.mono
                         font.pixelSize: 12
-                        text: (btRow.modelData.connected ? "* " : "  ") + btRow.modelData.name
+                        // No "* " / "  " prefix. It used to mark the connected
+                        // device, but it also pushed every name two characters
+                        // right of the "Bluetooth" heading above. The marker was
+                        // the third thing saying the same word anyway -- the row
+                        // is already tinted with root.accent and btState to the
+                        // right already reads "Connected" -- so dropping it
+                        // costs nothing and lets the names sit flush.
+                        text: btRow.modelData.name
                     }
 
                     Text {
@@ -1196,19 +1280,19 @@ ShellRoot {
                         text: {
                             const d = btRow.modelData;
                             if (d.pairing)
-                                return "pairing...";
+                                return "Pairing...";
                             if (d.state === BluetoothDeviceState.Connecting)
-                                return "connecting...";
+                                return "Connecting...";
                             if (d.state === BluetoothDeviceState.Disconnecting)
-                                return "disconnecting...";
+                                return "Disconnecting...";
                             // batteryAvailable needs bluez's experimental
                             // features, which configuration.nix turns on --
                             // most headsets report charge over that interface.
                             if (d.connected && d.batteryAvailable)
-                                return "connected  " + Math.round(d.battery * 100) + "%";
+                                return "Connected  " + Math.round(d.battery * 100) + "%";
                             if (d.connected)
-                                return "connected";
-                            return d.paired ? "paired" : "new";
+                                return "Connected";
+                            return d.paired ? "Paired" : "New";
                         }
                     }
                 }
@@ -1226,7 +1310,7 @@ ShellRoot {
                     color: bt.scanning ? root.accent : root.dim
                     font.family: root.mono
                     font.pixelSize: 11
-                    text: bt.scanning ? "  Scanning for devices... (click to stop)" : "  Scan for new devices"
+                    text: bt.scanning ? "Scanning for devices... (click to stop)" : "Scan for new devices"
                 }
 
                 // The beacons are hidden, not silently dropped. Without a count
@@ -1259,7 +1343,10 @@ ShellRoot {
                     color: root.dim
                     font.family: root.mono
                     font.pixelSize: 12
-                    text: "  Open blueman-manager (profiles, codecs)..."
+                    // Flush, like the nmtui row in the wifi picker: the whole
+                    // bluetooth column now starts on one left edge -- heading,
+                    // device names, scan row and this.
+                    text: "Open bluetui (profiles, codecs, pairing)..."
                 }
             }
 
@@ -1272,7 +1359,19 @@ ShellRoot {
 
         Process {
             id: btManagerProc
-            command: ["blueman-manager"]
+            // This used to be blueman-manager. bluetui is the escape hatch now:
+            // it is a terminal app, so it inherits the palette instead of
+            // fighting it, and unlike Quickshell it registers a bluez pairing
+            // agent of its own (org.bluez.Agent1 / RegisterAgent /
+            // RequestDefaultAgent are all in the binary), so a pairing started
+            // from inside it prompts inside it.
+            //
+            // Being a TUI it needs a terminal to live in. kitty rather than
+            // foot, matching nautilus-open-any-terminal in configuration.nix;
+            // foot stays on Super+Return. --class gives the window its own
+            // app-id so a niri window rule can float it without catching every
+            // other kitty.
+            command: ["kitty", "--class", "bluetui", "-e", "bluetui"]
         }
     }
 

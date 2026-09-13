@@ -1063,6 +1063,24 @@ in
         # Pipewire, but pavucontrol already does it well.
         pkgs.pavucontrol
 
+        # Bluetooth escape hatch, the same role pavucontrol plays for audio:
+        # profile/codec switching and anything the bar's picker does not cover.
+        # The bar opens it as `kitty --class bluetui -e bluetui`.
+        #
+        # This replaces blueman-manager, which was the previous escape hatch and
+        # is a GTK3 tree view that looks nothing like the rest of the desktop.
+        # bluetui is a TUI, so it inherits the terminal palette for free rather
+        # than needing to be themed, and it registers a bluez pairing agent of
+        # its own -- org.bluez.Agent1, AgentManager1, RegisterAgent and
+        # RequestDefaultAgent are all present in the binary, checked the same way
+        # the quickshell binary was checked below and found to have none. So a
+        # pairing begun inside bluetui is answered inside bluetui.
+        #
+        # That does not make blueman redundant: bluetui only holds an agent while
+        # it is open, and pairing from the bar needs one registered permanently.
+        # See services.blueman.enable below.
+        pkgs.bluetui
+
         # File manager. Chosen over thunar/nemo/dolphin because the GNOME and
         # GTK xdg-desktop-portal backends are already installed (programs.niri.
         # enable pulls them in for screencast and file chooser), so nautilus
@@ -1260,6 +1278,56 @@ in
   # Mutually exclusive with TLP; TLP is not enabled here.
   services.power-profiles-daemon.enable = true;
 
+  # Intel HWP ("Speed Shift") hands P-state selection to the CPU itself: the
+  # kernel writes a min/max/EPP window to HWP_REQUEST and the hardware picks a
+  # frequency inside it from observed utilisation. The i7-7660U here has no
+  # P/E core split -- hybrid topology starts at Alder Lake -- so this scaling is
+  # the whole of its power management, alongside the C-states.
+  #
+  # It judges by *sustained* utilisation, which is right for a compile and wrong
+  # for anything that alternates short CPU bursts with waiting on I/O: app
+  # startup, page loads, a nix build that spends its time on the disk. Averaged
+  # over wall clock those look idle, so the hardware keeps the frequency down
+  # and every burst between I/O operations runs slow. EPP=balance_power, which
+  # power-profiles-daemon sets on battery, biases it to wait even longer.
+  #
+  # hwp_dynamic_boost makes intel_pstate watch for iowait wakeups and lift the
+  # HWP *floor* for the length of the burst -- not the ceiling, which is already
+  # maximum. So it cannot make the CPU faster than it could otherwise go; it
+  # stops it choosing to go slow. Measured on this machine before enabling:
+  # cpu0 spent 54% of a 5s idle sample in C10 and ~77% across all C-states,
+  # which the boost leaves alone, because idle produces no iowait wakeups.
+  #
+  # Off by default upstream: the boosted bursts cost more power and not every
+  # workload repays it. Enabled here because the burst case is exactly the
+  # "system should wake up when I ask it to" behaviour wanted, and the
+  # steady-state cost is nil.
+  #
+  # There is no kernel parameter for it and the sysfs value resets each boot,
+  # hence a unit. It needs intel_pstate in active mode with HWP and the
+  # powersave governor -- all true here. Under the performance governor the
+  # floor is already the ceiling and the knob does nothing.
+  systemd.services.hwp-dynamic-boost = {
+    description = "Enable intel_pstate HWP dynamic boost";
+    wantedBy = [ "multi-user.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+    # Guarded rather than a bare write: the file exists only when the CPU has
+    # HWP and intel_pstate came up in active mode. On a kernel that fell back to
+    # acpi-cpufreq this should log and move on, not fail the boot.
+    script = ''
+      f=/sys/devices/system/cpu/intel_pstate/hwp_dynamic_boost
+      if [ -w "$f" ]; then
+        echo 1 > "$f"
+        echo "hwp_dynamic_boost = $(cat "$f")"
+      else
+        echo "$f absent or read-only -- intel_pstate not in active HWP mode, nothing to do"
+      fi
+    '';
+  };
+
   # Quickshell.Bluetooth -> adapters, pairing, connect/disconnect.
   hardware.bluetooth = {
     enable = true;
@@ -1276,11 +1344,37 @@ in
   # checked directly: no org.bluez.Agent1, AgentManager1 or RegisterAgent string
   # appears anywhere in the quickshell binary. Without an agent the bar can
   # connect devices that are already bonded, but first-time pairing fails with
-  # "no agent available". blueman supplies the agent; blueman-manager is also
-  # the escape hatch for profile/codec fiddling, the way pavucontrol is for
-  # audio. The applet that actually registers the agent is started per-user by
+  # "no agent available". blueman supplies the agent, and that is now the *only*
+  # reason it is installed: the escape hatch for profile/codec fiddling moved to
+  # bluetui (see home.packages above), which is a terminal app and matches the
+  # rest of the desktop. blueman-manager is still on PATH, because the agent and
+  # the manager ship in one package and splitting them would mean an overlay
+  # rebuilding blueman to delete one binary -- but nothing launches it any more.
+  # The applet that actually registers the agent is started per-user by
   # home-manager below.
   services.blueman.enable = true;
+
+  # ...and exactly once. This package ships an XDG autostart entry at
+  # $out/etc/xdg/autostart/blueman.desktop, which systemd's xdg-autostart
+  # generator turns into app-blueman@autostart.service -- a *second* copy of the
+  # applet on top of the home-manager unit. They raced every boot and the loser
+  # came up half-initialised:
+  #
+  #   blueman-applet[2608]: ERROR AgentManager:20 on_register_failed:
+  #     /org/bluez/obex/agent/blueman org.bluez.obex.Error.AlreadyExists
+  #
+  # Which copy wins is a race, so which process owns the pairing agent was
+  # nondeterministic. Masking the generated unit leaves home-manager's
+  # blueman-applet.service as the single owner. /etc/systemd/user outranks
+  # $XDG_RUNTIME_DIR/systemd/generator.late in the user unit search path, so a
+  # mask here beats the generator.
+  #
+  # This also takes out blueman-tray, which the duplicate applet spawned and
+  # which had nothing to draw into -- the Quickshell bar implements no
+  # SystemTray -- so it just logged GTK assertion failures all session. Verified
+  # by stopping the unit live: the tray exited, did not respawn from the
+  # surviving applet, and org.blueman.Applet stayed owned.
+  systemd.user.units."app-blueman@autostart.service".enable = false;
 
   # The Bluetooth controller on this machine is a Broadcom BCM4350C0 hanging off
   # a UART (dw-apb-uart -> serial0-0 -> hci_uart_bcm), not USB, and its setup
