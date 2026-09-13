@@ -19,7 +19,7 @@ Everything below is declared in `nixos/configuration.nix` — there is nothing t
 | | |
 | --- | --- |
 | **niri** | Scrolling-tiling Wayland compositor. The window manager. |
-| **Quickshell** | The top bar — clock, battery, CPU/mem/disk, wifi, bluetooth, audio, clipboard history. Written from scratch in `config/quickshell/shell.qml`. |
+| **Quickshell** | The top bar — clock, battery, CPU/mem/disk, wifi, bluetooth, audio, clipboard history. Status cells are Nerd Font icons rather than `CPU`/`RAM`/`BAT` labels, and several of them carry state in the glyph itself (battery fill level, volume level, muted, radio off). Written from scratch in `config/quickshell/shell.qml`. |
 | **fuzzel** | Application launcher (`Super+Space`). |
 | **mako** | Notification daemon. |
 | **wpaperd** | Wallpaper daemon (a 4K mountain landscape). |
@@ -63,7 +63,7 @@ Everything below is declared in `nixos/configuration.nix` — there is nothing t
 | | |
 | --- | --- |
 | **PipeWire** (+ ALSA, PulseAudio, rtkit) | Audio stack. |
-| **BlueZ + blueman** | Bluetooth, with the applet autostarted. |
+| **BlueZ + blueman** | Bluetooth, with the applet autostarted. A `bluetooth-uart-recover` unit re-probes the controller at boot when it fails to come up — see below. |
 | **upower**, **power-profiles-daemon** | Battery reporting and power profile switching. |
 | **brightnessctl** | Backlight keys. |
 | **gvfs** | Trash, MTP, and network mounts for Nautilus. |
@@ -394,6 +394,16 @@ case the new branch is skipped and rendering is identical to stock. Drop the
 `overrideAttrs` and the two flags if you would rather not carry a patch; you get
 the stock two-line clock.
 
+The glyph table is shared with the bar on purpose. Both draw the same Material
+Design cells — `nf-md-battery_outline` under 10%, `nf-md-battery_10`…`_90` for
+the tenths in between, `nf-md-battery` at full and `nf-md-battery_charging`
+while on mains — so locking the screen does not change the picture you were
+just looking at. If you change one, change the other: the table is in
+`battext()` in the patch and in the battery `IconCell` in `shell.qml`. The one
+thing that does *not* carry across is colour — the bar turns peach under 20% and
+red under 10%, while swaylock draws the whole battery line in `--text-color` and
+has no per-line colour option.
+
 **`--ignore-empty-password` fixes a real bug, not a cosmetic one.** swayidle
 blanks the panel 30s after locking, and the natural way to wake it is to tap
 Enter — which reaches the still-running swaylock, submits an empty password, and
@@ -434,6 +444,110 @@ it is upstream code on both sides.
 uses for the screenshot binds, already proven working here. If you ever want a
 GUI recorder back, check whether `pipewiresrc` has learned to negotiate
 modifiers first — otherwise it will fail exactly the same way.
+
+**Idle auto-suspend is off, because the SSD does not survive suspend.** Worth
+reading before turning it back on, and worth reading for the diagnosis, which
+went through two wrong answers first.
+
+The symptom was reported as a lock-screen problem: *"the screen goes off, then
+my password is always wrong and the only way back is a reboot."* That points
+squarely at swaylock and PAM. Both are innocent — but so was the second answer,
+that the machine never resumed at all. It does resume. The kernel runs, niri
+redraws, the lock screen accepts keystrokes. What does not come back is the
+disk.
+
+The proof is in what the journal does *not* contain. Every suspend is the last
+line of its boot; there is no entry of any kind afterwards. That looks like a
+dead kernel until you notice NetBird logs about forty lines a minute during
+normal operation, and the failure window is minutes long while someone retypes
+a password. Hundreds of missing lines, from a process that is demonstrably still
+running. journald was alive and simply could not write. Everything else follows:
+PAM has to exec `unix_chkpwd` out of `/nix/store` and read `/etc/shadow`, so with
+no storage every password is "wrong" no matter what is typed, and nothing new
+can be exec'd, so rebooting really is the only way out.
+
+The controller is an `APPLE SSD AP0128J` behind PCI `106b:2003` — Apple's own
+ANS2. The kernel already treats it as odd, applying `NVME_QUIRK_SINGLE_VECTOR`
+(hence `1/0/0 default/read/poll queues` in the boot log). What it does not apply
+to this ID is `NVME_QUIRK_SIMPLE_SUSPEND`, and that is the bug. `nvme_suspend()`
+only shuts the controller down and does a full reset on resume when the platform
+suspends via firmware; under s2idle it does not, so the ANS2 is left in a
+host-managed power state it does not survive and returns attached but never
+completing I/O. [The same failure is documented on T2
+Macs](https://ratatoskr.run/linux-nvme/2026/09/17519939), where the fix is to
+add the quirk — and [the MacBookPro14,x notes](https://takachin.github.io/mbp2017-linux-note/en/suspend-resume.html)
+describe the same PCIe-switch devices failing with "Unable to change power
+state".
+
+Two earlier suspects were tested and cleared, which is why they are named here
+rather than re-tried: the sleep state (a hang was recorded under `s2idle` and
+under `deep`, identically) and `facetimehd` (it deinitialises immediately before
+every hang and leaks memory doing it, but a suspend with the module `rmmod`-ed
+first hung anyway).
+
+The current mitigation is three settings that need no patched kernel —
+`nvme_core.default_ps_max_latency_us=0` to disable APST, `pcie_aspm=off` because
+`nvme_suspend()` also takes the safe shutdown path when ASPM is off on the
+device, and an `nvme-no-d3cold` unit holding the NVMe and its root port out of
+D3cold. The ASPM reasoning is inferred from the driver's logic rather than
+confirmed. If suspend still dies, the definitive fix is patching `106b:2003`
+into `nvme_id_table` with `NVME_QUIRK_SIMPLE_SUSPEND`, which costs a full kernel
+build on a 2017 dual-core. Re-enable the 900 s timer only once a suspend has
+actually been watched to come back.
+
+Closing the lid does not suspend either, for the same reason —
+`HandleLidSwitch` and `HandleLidSwitchExternalPower` are both `lock`. Disabling
+the idle timer only closed the unattended route into it; shutting the lid still
+walked straight in. Note that logind does not lock anything itself when
+set to `lock`, it only emits a Lock signal on the session bus, so swayidle needs
+a matching `lock` event or the lid does nothing at all — the two have to move
+together. The cost is that a closed laptop now stays awake and will run its
+battery flat in a bag. That is a deliberate trade against losing the session,
+and it reverts to `suspend` along with the 900 s timer once resume is proven.
+
+Two smaller things came out of the same investigation. `lock-screen` now exits
+early if a locker is already running: the 300 s timeout and the `before-sleep`
+hook both ask to lock, only one client can hold `ext_session_lock_v1`, and the
+loser was logging `refusing lock as already locked` / `Failed to daemonize` on
+every single idle suspend — harmless, but enough routine noise to bury a real
+failure. And the lock screen now passes `--show-failed-attempts` and
+`--indicator-caps-lock`, because "it says my password is wrong" had no
+observable detail behind it: a stray character from the keypress that woke the
+panel, Caps Lock left on, and a modifier stuck across a resume all look
+identical on a screen that shows nothing but `Wrong!`. Escape clears the
+password buffer, which handles the stray-character case.
+
+**The Bluetooth controller needs a retry at boot, and the picker hides most of
+what it finds.** Two unrelated-looking problems, both worth knowing about.
+
+The radio is a Broadcom BCM4350C0 on a UART, not USB. Apple's ACPI tables do not
+describe its reset GPIO the way `hci_bcm` expects, so the driver cannot reset the
+chip before talking to it and every boot logs `No reset resource, using default
+baud rate`. Usually the baud-rate command fails instantly with `-16` (EBUSY) and
+the driver carries on regardless; about one boot in five the chip does not answer
+at all, the command times out with `-110`, and setup aborts. The trap is what
+that looks like afterwards: `bluetoothd` is running and healthy,
+`/sys/class/bluetooth/hci0` exists and looks normal, but no adapter is ever
+published on D-Bus. `bluetoothctl list` prints nothing and the bar reads *"bluez
+not running"* — which is the one thing that is definitely not wrong.
+`bluetooth-uart-recover` checks D-Bus (not sysfs, which lies here) after
+`bluetooth.service`, reloads `hci_uart` if no adapter turned up, and powers the
+adapter on afterwards. To recover by hand:
+`sudo rfkill unblock bluetooth && sudo modprobe -r hci_uart && sudo modprobe hci_uart`.
+
+Separately, the picker deliberately shows a small fraction of what a scan
+returns. A scan from a flat picks up around sixty devices, of which roughly eight
+ever say what they are; the rest are BLE privacy beacons — phones, watches, tags
+— advertising randomised addresses that rotate every few minutes. BlueZ still
+creates a device for each and fills `Alias` with the MAC in dashes because there
+is nothing else to put there, which is where rows like `62-C8-07-D8-6F-DA` came
+from. None of them are pairable. The list therefore keeps anything paired,
+bonded, trusted, connected or mid-pairing, plus discovery results that published
+a real `Name`, and collapses those by name — a single conference remote was
+advertising from four addresses at once and filling four identical rows. The
+count of what was held back is printed next to the scan row, so an empty result
+reads as *"nothing here is announcing itself"* rather than *"the radio is
+broken"*.
 
 **NetBird runs unhardened.** Hardened mode uses `ProtectSystem = "strict"`
 (read-only `/etc`) and its DNS integration assumes systemd-resolved. This system

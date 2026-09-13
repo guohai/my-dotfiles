@@ -479,6 +479,24 @@ binds {
     XF86MonBrightnessUp allow-when-locked=true { spawn "brightnessctl" "--class=backlight" "set" "+10%"; }
     XF86MonBrightnessDown allow-when-locked=true { spawn "brightnessctl" "--class=backlight" "set" "10%-"; }
 
+    // Keyboard backlight (F5/F6 on this MacBook). Nothing was bound to these,
+    // which is the whole reason the keyboard light "did not work" -- the
+    // hardware and the driver were fine the entire time. Verified: the Apple
+    // SPI Keyboard input device advertises KEY_KBDILLUMDOWN (229) and
+    // KEY_KBDILLUMUP (230), and writing to the LED lights it.
+    //
+    // --class=leds is mandatory. Without it brightnessctl picks the first
+    // device it finds, which is acpi_video0 in the backlight class -- the
+    // screen. The device name is spelled with two colons.
+    //
+    // Note this LED lives on spi-APP000D:00, the same device as the keyboard
+    // and trackpad, so applespi-rebind-resume tears it down and recreates it
+    // on every resume. The node comes back with brightness 0, so the light is
+    // off after waking even if it was on before. That is a known consequence
+    // of the rebind, not a separate fault.
+    XF86KbdBrightnessUp allow-when-locked=true { spawn "brightnessctl" "--class=leds" "--device=spi::kbd_backlight" "set" "+10%"; }
+    XF86KbdBrightnessDown allow-when-locked=true { spawn "brightnessctl" "--class=leds" "--device=spi::kbd_backlight" "set" "10%-"; }
+
     // Open/close the Overview: a zoomed-out view of workspaces and windows.
     // You can also move the mouse into the top-left hot corner,
     // or do a four-finger swipe up on a touchpad.

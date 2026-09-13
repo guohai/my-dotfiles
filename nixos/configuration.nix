@@ -205,6 +205,25 @@ let
   # the screen with the trackpad and no keystroke is generated at all.
   lockCmd = pkgs.writeShellScriptBin "lock-screen" ''
     set -u
+
+    # Never stack a second locker on a running one. Two paths ask to lock in
+    # quick succession: the 300s idle timeout, and then the before-sleep hook
+    # when something suspends the machine. Only one client can hold
+    # ext_session_lock_v1, so the second swaylock is refused by niri
+    # ("refusing lock as already locked with an active client"), exits 2, and
+    # this wrapper then reports "Failed to daemonize".
+    #
+    # That made before-sleep fail on the entire common path -- every journal
+    # from an idle suspend ended with those three lines. It is harmless on its
+    # own, since the first locker is still up and doing its job, but it means
+    # the one hook whose whole purpose is to guarantee a locked screen before
+    # sleep was reporting failure routinely, which would bury a genuine
+    # failure in noise. Exiting 0 when a locker already owns the session is
+    # the correct answer to "make sure the screen is locked".
+    if ${pkgs.procps}/bin/pgrep -x swaylock >/dev/null 2>&1; then
+      exit 0
+    fi
+
     images=(${lib.concatStringsSep " " (map (w: "${w}") lockWallpapersBlurred)})
     # $RANDOM is bash's, and this script runs under bash via writeShellScriptBin.
     pick="''${images[$((RANDOM % ''${#images[@]}))]}"
@@ -215,6 +234,18 @@ let
     # --fade-in is down from 0.4 to 0.15. With the blur precomputed it was the
     # last thing between the keypress and a readable clock. Put it back, or
     # drop the flag, to taste.
+    #
+    # --show-failed-attempts and --indicator-caps-lock are diagnostics, and
+    # they are here because their absence made a support question unanswerable.
+    # "It says my password is wrong" has several causes that look identical on
+    # a lock screen with no feedback: a stray character from the keypress that
+    # woke the panel, Caps Lock left on, or a modifier stuck across a resume.
+    # Without a counter you cannot tell one failed attempt from six, and
+    # without the Caps Lock indicator the single most common cause is
+    # completely invisible. Both are free.
+    #
+    # Escape clears the password buffer, which is the fix for the stray-letter
+    # case -- worth knowing, since nothing on screen says so.
     #
     # Do NOT put comments between the flags below. Every line here ends in a
     # backslash, so a `#` does not start a comment on its own line -- it eats
@@ -231,6 +262,8 @@ let
       --timestr '%H:%M' \
       --datestr '%-d %b' \
       --batstr '{icon} {p}%' \
+      --show-failed-attempts \
+      --indicator-caps-lock \
       --font 'JetBrainsMono Nerd Font' \
       --indicator \
       --indicator-radius 100 \
@@ -801,11 +834,57 @@ in
             timeout = 300;
             command = "${lockCmd}/bin/lock-screen -f";
           }
+          # The keyboard backlight follows the screen. A lit keyboard under a
+          # blank panel is never wanted, and the ambient sensor cannot know the
+          # difference -- a dark room reads the same whether you are sitting
+          # there or gone. So the compositor, which does know, says so.
+          #
+          # kbd-backlight-inhibit is a flag file under /run that the
+          # kbd-backlight-als daemon polls; see hardware-macbookpro14.nix for
+          # both ends. Referenced through /run/current-system/sw/bin rather
+          # than a store path because it is defined in the other module and
+          # there is no clean way to reach its derivation from here -- the
+          # profile path is stable and survives rebuilds either way.
+          #
+          # swayidle hands these to `sh -c`, so the semicolon works. Order
+          # matters on the way down only in that it does not: both are
+          # instantaneous and neither depends on the other.
           {
             timeout = 330;
-            command = "${pkgs.niri}/bin/niri msg action power-off-monitors";
-            resumeCommand = "${pkgs.niri}/bin/niri msg action power-on-monitors";
+            command = "${pkgs.niri}/bin/niri msg action power-off-monitors; /run/current-system/sw/bin/kbd-backlight-inhibit on";
+            resumeCommand = "${pkgs.niri}/bin/niri msg action power-on-monitors; /run/current-system/sw/bin/kbd-backlight-inhibit off";
           }
+          # Auto-suspend at 900s. This was DISABLED for a while, and the story
+          # is worth keeping because it explains three other settings in this
+          # file.
+          #
+          # The machine originally never resumed from suspend at all: five
+          # `PM: suspend entry (deep)` lines across seven days and not one
+          # `PM: suspend exit`. Every one was the last line of its boot. The
+          # user-visible shape was "the screen locks and then my password is
+          # always wrong, and I have to reboot", which looks like swaylock or
+          # PAM. Neither was at fault -- lock at 300s, panel off at 330s,
+          # suspend at 900s, and then the machine was simply gone.
+          #
+          # Three separate defects had to be fixed before this was safe to
+          # turn back on:
+          #
+          #   1. deep/S3 hung outright. `mem_sleep_default=s2idle` (see
+          #      boot.kernelParams) switched it to the state this generation of
+          #      MacBook actually uses.
+          #   2. The Apple ANS2 NVMe controller was not being shut down on the
+          #      s2idle path, so the disk came back wedged. See the
+          #      nvme-no-d3cold unit further down.
+          #   3. Suspend entry itself took 38-79s because the Intel LPSS SPI
+          #      controller was runtime-suspending underneath the driver. See
+          #      the udev rule in hardware-macbookpro14.nix.
+          #
+          # Re-enabled 2026-09-13 after `systemctl suspend` returned in 2.8s
+          # twice running, with matching `suspend exit (s2idle)` lines.
+          #
+          # If this ever starts losing sessions again, comment this block out
+          # first -- it is the only thing that suspends the machine unattended,
+          # and having it off costs nothing but battery.
           {
             timeout = 900;
             command = "${pkgs.systemd}/bin/systemctl suspend";
@@ -817,6 +896,14 @@ in
           # Lock *before* the machine sleeps, not after it wakes -- otherwise
           # the desktop is briefly visible on resume before the locker appears.
           before-sleep = "${lockCmd}/bin/lock-screen -f";
+
+          # logind's Lock signal. logind never locks anything itself -- it just
+          # announces the intent on the session bus and expects a listener.
+          # This is now reached via `loginctl lock-session` rather than by
+          # closing the lid (HandleLidSwitch went back to "suspend", see
+          # below), but it is still the only thing wired to that signal, so
+          # removing it would make lock-session a no-op.
+          lock = "${lockCmd}/bin/lock-screen -f";
         };
       };
 
@@ -1028,6 +1115,92 @@ in
   # home-manager below.
   services.blueman.enable = true;
 
+  # The Bluetooth controller on this machine is a Broadcom BCM4350C0 hanging off
+  # a UART (dw-apb-uart -> serial0-0 -> hci_uart_bcm), not USB, and its setup
+  # handshake is unreliable. Apple's ACPI tables do not expose the chip's reset
+  # GPIO in the shape hci_bcm expects, so every boot logs
+  #
+  #   hci_uart_bcm serial0-0: Unexpected number of ACPI GPIOs: 0
+  #   hci_uart_bcm serial0-0: No reset resource, using default baud rate
+  #
+  # and the driver has no way to physically reset the chip before talking to it.
+  # Usually it gets away with this: the baud-rate command comes back -16 (EBUSY)
+  # immediately, the driver shrugs, and the adapter registers. Roughly one boot
+  # in five the chip does not answer at all --
+  #
+  #   Bluetooth: hci0: command 0xfc18 tx timeout
+  #   Bluetooth: hci0: BCM: failed to write update baudrate (-110)
+  #   Bluetooth: hci0: BCM: Reset failed (-110)
+  #
+  # -- setup aborts, and hci0 stays in setup state forever. /sys/class/bluetooth
+  # /hci0 exists, bluetoothd is running and healthy, but no adapter is ever
+  # published on D-Bus, so `bluetoothctl list` is empty and the bar shows
+  # "bluez not running". Reloading hci_uart re-runs the probe and it works on
+  # the retry, which is all this unit does.
+  #
+  # The check is against D-Bus rather than sysfs on purpose: in the failed state
+  # the sysfs node is present and looks perfectly normal, and only bluez's own
+  # view distinguishes "controller registered" from "controller wedged".
+  #
+  # Boot is not failed if recovery does not help -- a laptop without working
+  # Bluetooth still boots. The journal line is the signal, and the picker
+  # already says "bluez not running" in the UI.
+  systemd.services.bluetooth-uart-recover = {
+    description = "Re-probe the Broadcom UART Bluetooth controller if bluez got no adapter";
+    after = [ "bluetooth.service" ];
+    wants = [ "bluetooth.service" ];
+    wantedBy = [ "multi-user.target" ];
+    path = with pkgs; [ kmod util-linux systemd coreutils gnugrep ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+    script = ''
+      have_adapter() {
+        busctl --system tree org.bluez 2>/dev/null | grep -q '/org/bluez/hci'
+      }
+
+      # bluetoothd publishes the adapter a moment after the service reports
+      # started, so a single immediate check would misfire on a healthy boot.
+      for _ in $(seq 1 10); do
+        have_adapter && break
+        sleep 1
+      done
+
+      if ! have_adapter; then
+        echo "no bluetooth adapter on the bus; re-probing hci_uart"
+        rfkill unblock bluetooth || true
+        modprobe -r hci_uart || true
+        sleep 1
+        modprobe hci_uart || true
+
+        for _ in $(seq 1 15); do
+          have_adapter && break
+          sleep 1
+        done
+      fi
+
+      if ! have_adapter; then
+        echo "still no bluetooth adapter after re-probe; giving up" >&2
+        exit 0
+      fi
+
+      # powerOnBoot above is bluez's Policy.AutoEnable, which only fires when
+      # the adapter appears in the normal way. One that arrives late, from the
+      # reload above or from a soft-block being cleared, can land powered down
+      # -- observed exactly that after a manual recovery: adapter present,
+      # Powered false, discovery silently finding nothing. Setting it here is
+      # idempotent and only ever runs at boot, so it cannot fight a radio the
+      # user switches off later.
+      adapter=$(busctl --system tree org.bluez 2>/dev/null |
+        grep -oE '/org/bluez/hci[0-9]+' | head -1)
+      if [ -n "$adapter" ]; then
+        busctl --system set-property org.bluez "$adapter" \
+          org.bluez.Adapter1 Powered b true || true
+      fi
+    '';
+  };
+
   # Quickshell.Networking talks to NetworkManager, which is already enabled
   # further down (networking.networkmanager.enable), so wifi needs nothing extra.
 
@@ -1088,6 +1261,11 @@ in
   imports =
     [ # Include the results of the hardware scan.
       ./hardware-configuration.nix
+      # Hand-written quirks for this MacBookPro14,1 chassis. Kept separate from
+      # hardware-configuration.nix because that file is regenerated by
+      # nixos-generate-config and would lose anything added to it. Drop this
+      # import if the config is ever restored onto other hardware.
+      ./hardware-macbookpro14.nix
       # home-manager as a NixOS module: user dotfiles are built and activated
       # as part of `nixos-rebuild switch`, not by a separate `home-manager`
       # command. `home-manager` is the pinned tarball from the let block above.
@@ -1119,7 +1297,131 @@ in
   # To go back to the default, delete this line -- or test one suspend without
   # rebuilding first:
   #     echo deep | sudo tee /sys/power/mem_sleep
-  boot.kernelParams = [ "mem_sleep_default=s2idle" ];
+  boot.kernelParams = [
+    "mem_sleep_default=s2idle"
+
+    # --- Resume survival for the Apple ANS2 NVMe controller ---
+    #
+    # The SSD is an APPLE SSD AP0128J behind PCI 106b:2003, Apple's own ANS2
+    # controller. The kernel already knows it is odd -- it applies
+    # NVME_QUIRK_SINGLE_VECTOR, which is why the boot log says
+    # "1/0/0 default/read/poll queues" instead of one queue per CPU.
+    #
+    # What it does NOT apply to this ID is NVME_QUIRK_SIMPLE_SUSPEND, and that
+    # is the bug. nvme_suspend() picks between two strategies: shut the
+    # controller down and do a full reset on resume, or leave it powered in a
+    # host-managed low power state. It only picks the shutdown path when the
+    # platform suspends via firmware. Under s2idle it does not, so the ANS2 is
+    # left in an NVMe power state it does not actually survive, and it comes
+    # back attached but never completing I/O.
+    #
+    # That is precisely the observed failure. The machine resumes: the kernel
+    # runs, niri redraws, the lock screen takes keystrokes. But nothing can
+    # read the disk, so PAM cannot exec unix_chkpwd or read /etc/shadow and
+    # every password is "wrong", and journald cannot write, which is why the
+    # journal has not one line after any suspend -- not even from NetBird,
+    # which otherwise logs about forty lines a minute. Rebooting is the only
+    # exit because nothing new can be exec'd from /nix/store.
+    #
+    # Two levers, neither requiring a patched kernel:
+    #
+    # default_ps_max_latency_us=0 disables APST outright, so the controller is
+    # never told to enter the autonomous low power states it mishandles.
+    #
+    # pcie_aspm=off is the more interesting one. nvme_suspend() also takes the
+    # safe shutdown path when ASPM is disabled on the device, so turning ASPM
+    # off should route this controller through the same code the missing quirk
+    # would have selected. Treat that as reasoned from the driver's logic
+    # rather than confirmed -- it is the cheapest thing that could work, and
+    # the definitive fix is patching 106b:2003 into nvme_id_table with
+    # NVME_QUIRK_SIMPLE_SUSPEND, which costs a full kernel build on a 2017
+    # dual-core.
+    #
+    # Both cost a little idle power. That is a better trade than a machine
+    # that cannot come back.
+    "nvme_core.default_ps_max_latency_us=0"
+    "pcie_aspm=off"
+  ];
+
+  # Keep the NVMe and the root port it hangs off out of D3cold. Linux cannot
+  # reliably bring these back on this machine -- the documented symptom on
+  # MacBookPro14,x is "Unable to change power state" for exactly the devices
+  # under this PCIe switch. Both default to allowing it.
+  #
+  # A oneshot at boot rather than a pre-suspend hook: the attribute persists
+  # once written, and a hook that fails would fail silently at the worst
+  # possible moment.
+  #
+  # PORTABILITY: matched by PCI vendor:device, not by bus address. The obvious
+  # version of this hardcodes 0000:01:00.0, which is where the controller
+  # happens to sit on this machine -- but this file is meant to restore onto
+  # other hardware, and that same address elsewhere is some unrelated device
+  # whose power management would then be quietly altered. 106b:2001 / 2003 /
+  # 2005 are the three Apple ANS/ANS2 IDs the nvme driver carries explicit
+  # entries for; anything else, including every non-Apple machine, matches
+  # nothing and the unit is a no-op.
+  systemd.services.nvme-no-d3cold = {
+    description = "Keep any Apple ANS2 NVMe and its PCIe root port out of D3cold";
+    wantedBy = [ "multi-user.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+    script = ''
+      found=0
+      for dev in /sys/bus/pci/devices/*; do
+        [ -e "$dev/vendor" ] || continue
+        [ "$(cat "$dev/vendor")" = "0x106b" ] || continue
+        case "$(cat "$dev/device")" in
+          0x2001 | 0x2003 | 0x2005) ;;
+          *) continue ;;
+        esac
+
+        found=1
+        # The controller, and the port it hangs off -- both have to stay out
+        # of D3cold or the parent takes the child down with it. The parent of
+        # a root port is the host bridge, which has no d3cold_allowed at all,
+        # so the -w test is what stops this walking up too far.
+        real=$(readlink -f "$dev")
+        for target in "$real" "$(dirname "$real")"; do
+          f="$target/d3cold_allowed"
+          if [ -w "$f" ]; then
+            echo 0 > "$f" && echo "d3cold disabled for $(basename "$target")"
+          fi
+        done
+      done
+
+      if [ "$found" = 0 ]; then
+        echo "no Apple ANS2 NVMe controller here; nothing to do"
+      fi
+    '';
+  };
+
+  # Closing the lid suspends. This was "lock" for a while, as a stopgap while
+  # suspend was fatal on this machine -- a laptop that stays awake in a bag and
+  # runs itself flat was the lesser evil against one that loses the session
+  # outright. Restored to the normal behaviour 2026-09-13 once suspend was
+  # shown to return in ~2.8s; see the long note on the 900s swayidle timer
+  # above for the three defects that had to be fixed first.
+  #
+  # swayidle's before-sleep event is what puts the lock screen up, so the
+  # screen is already locked before the machine goes down rather than after it
+  # comes back.
+  #
+  # settings.Login.* rather than the old services.logind.lidSwitch spelling --
+  # the short options still work but warn on eval that they were renamed.
+  #
+  # HandlePowerKey: logind's default is "poweroff", with no confirmation and no
+  # regard for whether the session is merely locked. A stray press at a
+  # swaylock prompt therefore kills the session outright. "suspend" makes the
+  # key a sleep/wake toggle, which is what the key does on this chassis under
+  # macOS anyway. Holding it for ~4s still cuts power at the firmware level, so
+  # nothing is lost by giving up the short press.
+  services.logind.settings.Login = {
+    HandleLidSwitch = "suspend";
+    HandleLidSwitchExternalPower = "suspend";
+    HandlePowerKey = "suspend";
+  };
 
   # Configure network connections interactively with nmcli or nmtui.
   networking.networkmanager.enable = true;
