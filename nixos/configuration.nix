@@ -40,13 +40,34 @@
 { config, lib, pkgs, ... }:
 
 let
-  # home-manager pinned by hash rather than pulled from a channel, so the
-  # version lives in this file and rebuilds are reproducible. To upgrade, bump
-  # the branch in the URL and refresh the hash with:
-  #   nix-prefetch-url --unpack <url>
+  # home-manager pinned by commit rather than pulled from a channel, so the
+  # version lives in this file and rebuilds are reproducible.
+  #
+  # This URL names a *commit*, not a branch, and that is the whole point. It
+  # used to be .../archive/release-26.05.tar.gz with a sha256 beside it, which
+  # looks pinned but is not: the hash pins the content while the URL keeps
+  # moving, so the two silently disagree the moment upstream pushes to the
+  # branch. That is not a hypothetical -- it broke a rebuild on 2026-09-13,
+  # the day after ec17201 landed, with
+  #
+  #   error: hash mismatch in file downloaded from
+  #     'https://github.com/.../archive/release-26.05.tar.gz'
+  #     specified: sha256:0fyjh6bv...
+  #     got:       sha256:02mrnlir...
+  #
+  # and it would have kept happening on every upstream push. A commit URL is
+  # immutable, so the hash can never go stale on its own -- an upgrade becomes
+  # something this file records deliberately instead of something that arrives
+  # unannounced and fails the next unrelated rebuild.
+  #
+  # To upgrade, resolve the branch head and refresh both lines together:
+  #   rev=$(curl -sSL https://api.github.com/repos/nix-community/home-manager/commits/release-26.05 \
+  #         | grep -m1 '"sha"' | cut -d'"' -f4)
+  #   nix-prefetch-url --unpack "https://github.com/nix-community/home-manager/archive/$rev.tar.gz"
   home-manager = builtins.fetchTarball {
-    url = "https://github.com/nix-community/home-manager/archive/release-26.05.tar.gz";
-    sha256 = "0fyjh6bv6p72ynz0pjkzlf1966h2dq40ivwbzy73lk45aqam1ymh";
+    # release-26.05 as of 2026-09-12
+    url = "https://github.com/nix-community/home-manager/archive/ec172013fa62135f58fb58dd17ae9651e8f39727.tar.gz";
+    sha256 = "02mrnlirg3jxqfgkv3jh8ar9hqiwhwqq9m7n5jv5hq40vjzq2s1d";
   };
 
   # Desktop wallpaper, pinned by hash so it is part of the system closure
@@ -639,6 +660,23 @@ in
     ];
   };
 
+  # /dev/i2c-* plus the i2c group and the udev rules that hand the group write
+  # access to them. Loads the i2c-dev module, which is not built in.
+  #
+  # This exists for one reason: external monitor brightness in the bar. Every
+  # DisplayPort and HDMI link carries an I2C side channel to the monitor's
+  # DDC/CI registers, and each connected display shows up as its own i2c
+  # adapter. Setting VCP feature 0x10 on one is what moves its backlight.
+  #
+  # The buses are not only display links -- the SMBus the SPI keyboard and the
+  # sensors hang off enumerates here too. Handing the i2c group raw access to
+  # every adapter is broader than the job needs; the narrower alternative is a
+  # udev rule matching only i2c adapters whose parent is the i915 card. Left
+  # broad here because this is a single-user laptop and ddcutil probes buses to
+  # find the displays in the first place, so restricting it to the ones already
+  # known to be displays is circular.
+  hardware.i2c.enable = true;
+
   # Runs inside the graphical session because it needs NIRI_SOCKET, which niri
   # publishes into the systemd --user environment when it starts.
   systemd.user.services.xremap = {
@@ -1081,6 +1119,26 @@ in
         # See services.blueman.enable below.
         pkgs.bluetui
 
+        # Backs the brightness rows in the bar's display picker.
+        #
+        # An external monitor has no backlight device -- /sys/class/backlight is
+        # only ever the internal panel, which is why brightnessctl below can
+        # reach eDP-1 and nothing else. The panel on the other end of a
+        # DisplayPort cable is adjusted by talking DDC/CI to it over the I2C
+        # channel embedded in the link, which is what ddcutil does: VCP feature
+        # 0x10 is luminance, so `ddcutil setvcp 10 60` is the whole operation.
+        #
+        # Needs hardware.i2c.enable below for the /dev/i2c-* nodes and the i2c
+        # group, and the user in that group; without both, ddcutil sees no
+        # displays and the bar silently falls back to showing nothing for
+        # external brightness.
+        #
+        # Not every monitor answers. DDC is optional and plenty of panels
+        # either ignore it or implement it badly, so `ddcutil detect` is the
+        # test that matters -- the bar treats a display it cannot find as
+        # simply having no brightness control rather than erroring at you.
+        pkgs.ddcutil
+
         # File manager. Chosen over thunar/nemo/dolphin because the GNOME and
         # GTK xdg-desktop-portal backends are already installed (programs.niri.
         # enable pulls them in for screencast and file chooser), so nautilus
@@ -1150,7 +1208,12 @@ in
     description = "lab";
     # input  -> read /dev/input/event* (xremap grabs the keyboard)
     # uinput -> write /dev/uinput (xremap emits the rewritten events)
-    extraGroups = [ "wheel" "networkmanager" "video" "audio" "docker" "input" "uinput" ];
+    # i2c    -> write /dev/i2c-* (ddcutil drives external monitor brightness
+    #           over DDC/CI; see hardware.i2c.enable below). Adding a group
+    #           does not affect an already-running session -- the credentials
+    #           were fixed at login -- so this one needs a full logout before
+    #           the bar's brightness rows can reach an external panel.
+    extraGroups = [ "wheel" "networkmanager" "video" "audio" "docker" "input" "uinput" "i2c" ];
     # fish is not POSIX-compatible (`export X=y` is `set -x X y`, and bash
     # snippets cannot be `source`d). root is deliberately left on bash so
     # there is always a POSIX recovery shell if a fish change goes wrong.
@@ -1462,6 +1525,146 @@ in
     '';
   };
 
+  # The WiFi half of the same Broadcom combo part (BCM4350, PCI 14e4:43a3 at
+  # 0000:02:00.0) has its own intermittent bring-up failure, and it is a
+  # different one from the Bluetooth handshake above -- this is the radio not
+  # answering at all rather than a setup command timing out.
+  #
+  # Observed once in eight boots. The device enumerates perfectly: config space
+  # reads work, and the BARs come back byte-for-byte identical to a healthy
+  # boot --
+  #
+  #   pci 0000:02:00.0: [14e4:43a3] type 00 class 0x028000 PCIe Endpoint
+  #   pci 0000:02:00.0: BAR 0 [mem 0x92400000-0x92407fff 64bit]
+  #   pci 0000:02:00.0: BAR 2 [mem 0x92000000-0x923fffff 64bit]
+  #
+  # -- and then seven seconds later brcmfmac's first MMIO read comes back all
+  # ones and the probe gives up:
+  #
+  #   brcmfmac: brcmf_chip_recognition: MMIO read failed: 0xffffffff
+  #   brcmfmac: brcmf_pcie_probe: failed 14e4:43a3
+  #
+  # Nothing is logged in between. No AER report, no link-down, no bus error,
+  # and pcie_aspm=off is already on the kernel command line so this is not the
+  # link being powered down underneath the driver. The chip simply stopped
+  # responding between enumeration and probe. Re-enumerating it is the only
+  # lever software has left, and it is the same lever `setpci`-era advice and
+  # the Broadcom bug reports all land on.
+  #
+  # The match is on vendor *and* class, not on the 0000:02:00.0 address. The
+  # FaceTime HD camera is also a Broadcom part on this machine (14e4:1570 at
+  # 0000:03:00.0), so vendor alone would be ambiguous -- class 0x028000 is what
+  # separates the network controller from the camera's 0x048000. Matching by
+  # property rather than by bus address also means a rescan that lands the card
+  # at a different slot does not silently turn this unit into a no-op.
+  #
+  # The health check is "is there a wireless netdev", not "is brcmfmac bound".
+  # A bound driver is not the same as a working radio, and an rfkill block --
+  # soft or hard -- leaves the interface present, so the switch being off never
+  # triggers a pointless remove/rescan cycle.
+  #
+  # Ordering is deliberately *after* NetworkManager rather than before it.
+  # NetworkManager picks up a wifi device that appears late perfectly well, so
+  # there is nothing to gain by holding up the network target, and blocking it
+  # would put this unit's retry loop on the critical path of every healthy
+  # boot. As written the healthy path breaks out of the first loop iteration
+  # and costs nothing.
+  #
+  # Rescan is scoped to the parent bridge (0000:00:1d.0, derived from the
+  # device rather than hardcoded) instead of the global /sys/bus/pci/rescan.
+  # A global rescan would also walk Thunderbolt and every other bus, which is
+  # a much larger blast radius than this problem justifies.
+  #
+  # As with Bluetooth, boot is not failed if recovery does not work. A laptop
+  # with no wifi still boots, and there is a wired/tethered path to fix it.
+  systemd.services.wifi-pcie-recover = {
+    description = "Re-enumerate the Broadcom PCIe wifi card if its probe failed";
+    after = [ "NetworkManager.service" ];
+    wants = [ "NetworkManager.service" ];
+    wantedBy = [ "multi-user.target" ];
+    path = with pkgs; [ kmod coreutils ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+    script = ''
+      have_wifi() {
+        for w in /sys/class/net/*/wireless; do
+          [ -e "$w" ] && return 0
+        done
+        return 1
+      }
+
+      # Broadcom (0x14e4) network controller (class 0x028000). Deliberately not
+      # the camera, which is the same vendor with class 0x048000.
+      find_wifi_pci() {
+        for d in /sys/bus/pci/devices/*; do
+          [ "$(cat "$d/vendor" 2>/dev/null)" = "0x14e4" ] || continue
+          [ "$(cat "$d/class"  2>/dev/null)" = "0x028000" ] || continue
+          echo "$d"
+          return 0
+        done
+        return 1
+      }
+
+      # brcmfmac loads and probes a couple of seconds into boot, so an
+      # immediate single check would misfire on a perfectly healthy boot.
+      for _ in $(seq 1 10); do
+        have_wifi && break
+        sleep 1
+      done
+
+      if have_wifi; then
+        exit 0
+      fi
+
+      dev=$(find_wifi_pci) || {
+        echo "no Broadcom wifi device in sysfs at all; nothing to re-enumerate" >&2
+        exit 0
+      }
+
+      # Resolve the parent bridge before the remove, because $dev stops
+      # existing the moment it succeeds.
+      bridge=$(dirname "$(readlink -f "$dev")")
+
+      echo "wifi probe failed; re-enumerating $(basename "$dev") via $(basename "$bridge")"
+      echo 1 > "$dev/remove" || true
+      sleep 1
+      if [ -w "$bridge/rescan" ]; then
+        echo 1 > "$bridge/rescan" || true
+      else
+        echo 1 > /sys/bus/pci/rescan || true
+      fi
+
+      for _ in $(seq 1 10); do
+        have_wifi && break
+        sleep 1
+      done
+
+      # The rescan re-probes with brcmfmac already resident, which is usually
+      # enough. If the card came back but the driver did not latch onto it,
+      # bounce the module so the probe runs from a clean state.
+      if ! have_wifi; then
+        echo "card re-enumerated but no interface; reloading brcmfmac"
+        modprobe -r brcmfmac || true
+        sleep 1
+        modprobe brcmfmac || true
+
+        for _ in $(seq 1 15); do
+          have_wifi && break
+          sleep 1
+        done
+      fi
+
+      if ! have_wifi; then
+        echo "still no wifi interface after re-enumeration; giving up" >&2
+        exit 0
+      fi
+
+      echo "wifi recovered"
+    '';
+  };
+
   # Quickshell.Networking talks to NetworkManager, which is already enabled
   # further down (networking.networkmanager.enable), so wifi needs nothing extra.
 
@@ -1539,6 +1742,28 @@ in
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = true;
   boot.loader.systemd-boot.consoleMode = "0";
+
+  # Keep the boot menu to the current generation plus two to fall back to.
+  #
+  # This bounds the *menu*, not the profile: a rebuild writes at most this many
+  # .conf files into /boot/loader/entries and garbage-collects the kernels and
+  # initrds that no remaining entry references. The generations themselves stay
+  # in /nix/var/nix/profiles, still rollback-able with `nixos-rebuild
+  # --rollback` or by switching to system-N-link by hand; only their menu entry
+  # is gone. Actually retiring them is `nix-env -p
+  # /nix/var/nix/profiles/system --delete-generations`, a separate command that
+  # this setting neither performs nor implies.
+  #
+  # Worth setting because /boot is the 300M EFI partition Apple's installer
+  # laid down and it cannot be grown without moving the root partition. The
+  # entries are ~400 bytes each and were never the problem; the initrds are 41M
+  # apiece. Every rebuild that changes an initrd input -- a kernel module, a
+  # firmware package, an fs option -- adds another, and unreferenced ones are
+  # only reaped when the last entry pointing at them is dropped. Without a
+  # limit no entry is ever dropped, so at 43 generations /boot held four
+  # initrds and sat at 61% on a partition where two more would have filled it
+  # mid-rebuild, leaving a half-written bootloader.
+  boot.loader.systemd-boot.configurationLimit = 3;
 
   # PORTABILITY: Apple laptop suspend fix. Probably unnecessary elsewhere.
   #

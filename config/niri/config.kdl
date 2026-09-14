@@ -108,6 +108,72 @@ input {
     position x=1280 y=0
 }
 
+// The 40" ultrawide. Matched by make/model rather than by connector so it
+// works on either Thunderbolt port -- the connector name flips between DP-1
+// and DP-2 depending on which one you plug into.
+//
+// Pinned to 5120x2160 because the EDID asks for the wrong thing. Its base
+// block marks 3840x2160@60 as preferred, and its first detailed timing gives
+// the panel as 934x400 mm. At 5120x2160 that is 0.182 x 0.185 mm per pixel --
+// square, so that is the real panel. At 3840x2160 it is 0.243 x 0.185, a
+// 1.31:1 pixel, so accepting the preferred mode stretches everything 31%
+// wider than it should be. niri has no reason to distrust "preferred", so it
+// took it and the desktop came up wrong.
+//
+// 60 Hz at that resolution is out of reach regardless. The monitor does
+// advertise 5120x2160@60, in a DisplayID extension block, needing a 725.26 MHz
+// pixel clock, and two separate things here refuse it:
+//
+//   - Kaby Lake caps the dot clock at the max CDCLK, 675 MHz at best on
+//     SKL/KBL. i915 filters the mode before it is ever offered, which is why
+//     `niri msg outputs` lists 5120x2160 only at 30.
+//   - 725.26 MHz x 24 bpp is 17.4 Gbps, over the 17.28 Gbps an HBR2 4-lane
+//     link carries. Alpine Ridge is DP 1.2, so HBR2 is the ceiling, and Kaby
+//     Lake predates DSC.
+//
+// 5120x2160@30 clears both of those comfortably -- 362 MHz, 8.7 Gbps against
+// a 4-lane HBR2 link, which is what this dock negotiates: the hub on it
+// enumerates as a USB 2.0 hub, so DP alt mode keeps all four lanes rather
+// than surrendering two to USB 3.
+//
+// 30 Hz is the price of correct geometry. Pointer motion shows it; text does
+// not. If the lag ever matters more than the stretch, comment this block out
+// and set the monitor's own OSD to 1:1 / aspect-preserving, so the 3840x2160
+// fallback is pillarboxed rather than stretched 31% wide.
+//
+// Do not read the atomic-test failures in the journal as evidence against
+// this mode. They were already running at 3840x2160@60 twenty seconds before
+// the mode was ever changed, and they ended in a dock dropout, not a rejected
+// modeset:
+//
+//   12:54:03.805  first "Atomic Test failed for new properties on crtc"
+//                 (436 of them, all at 3840x2160@60)
+//   12:54:24      5120x2160@30 set, applied, displayed correctly
+//   12:54:27.916  usb 1-8: USB disconnect       <- the hub dropped
+//   12:54:28.497  niri: disconnecting connector "DP-2"
+//
+// USB and DisplayPort went down together because they share the cable. After
+// a replug the link has been clean, zero atomic failures. If that recurs,
+// suspect the cable or the dock, not the timing.
+//
+// 5120 px across 934 mm is 139 dpi, high enough that scale 1 is legible but
+// small. 2 gives 2560x1080 logical -- the ultrawide drawn at the size of a
+// 21:9 1080p panel, with everything twice as large in linear terms.
+//
+// Integer 2 is also the cheap one. Both axes divide exactly, and it is the
+// only scale here that clients can hit natively: Wayland's older
+// wl_output.scale carries integers only, so a toolkit without
+// fractional-scale-v1 renders at exactly 2x and is pixel-perfect, where at
+// 1.5 it would draw at 2x and get downscaled. Nothing is resampled at 2.
+//
+// The cost is desktop area. 2560x1080 logical is less usable width than the
+// internal panel's 1462 plus half again, so a 21:9 ends up holding about two
+// comfortable columns rather than three.
+output "PNP(EVN) V40U46C 0000000000000" {
+    mode "5120x2160@30.000"
+    scale 2
+}
+
 // Settings that influence how windows are positioned and sized.
 // Find more information on the wiki:
 // https://niri-wm.github.io/niri/Configuration:-Layout
