@@ -1439,6 +1439,65 @@ in
   # surviving applet, and org.blueman.Applet stayed owned.
   systemd.user.units."app-blueman@autostart.service".enable = false;
 
+  # Hold hci_uart back from udev's automatic load so it can be loaded a few
+  # seconds later instead. This is an attempt at fixing the Bluetooth setup
+  # failure properly rather than recovering from it, and the evidence for it is
+  # the timing of the two loads on a boot where recovery was needed:
+  #
+  #   T+6.6s   hci_uart_bcm loads
+  #   T+9.2s   BCM: failed to write update baudrate (-110)   <- ETIMEDOUT
+  #   T+11.3s  BCM: Reset failed (-110)                         chip is silent
+  #
+  #   T+50.5s  hci_uart_bcm reloaded by bluetooth-uart-recover
+  #   T+51.2s  BCM: failed to write update baudrate (-16)    <- EBUSY, healthy
+  #            adapter registers
+  #
+  # -110 is the chip not answering; -16 is it answering and the driver moving
+  # on. A late load gets -16, an early load gets -110, which is the same
+  # conclusion upstream reached for the Apple Broadcom parts -- the 2025 patch
+  # adding msleep(200) "waiting for hardware warmup" to btbcm_setup_apple()
+  # fixes an identical -110 timeout. That patch is on the USB path and this
+  # controller is UART (0xfc18 is the vendor baud-rate command), so it does not
+  # apply directly, but the failure it describes is this one.
+  #
+  # The honest caveat: the reload may succeed because the *first* attempt woke
+  # the chip, not because more time had passed. Only this change distinguishes
+  # them. If the -110 still appears at T+15s, the warmup theory is wrong and
+  # this block should be removed rather than tuned upwards.
+  #
+  # Blacklisting only suppresses the automatic alias-driven load; an explicit
+  # modprobe still works, which is what makes this safe. If the unit below
+  # never runs, bluetooth-uart-recover still finds no adapter and still issues
+  # its own modprobe, so the fallback survives this change -- which is the only
+  # reason blacklisting a module the machine needs is acceptable at all.
+  boot.blacklistedKernelModules = [ "hci_uart" ];
+
+  systemd.services.bluetooth-uart-delayed-load = {
+    description = "Load hci_uart once the Broadcom controller has warmed up";
+    before = [ "bluetooth.service" ];
+    wantedBy = [ "bluetooth.service" "multi-user.target" ];
+    path = with pkgs; [ kmod coreutils ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+    # Ordered before bluetooth.service on purpose. bluez only applies
+    # Policy.AutoEnable to an adapter that appears in the normal way, so an
+    # adapter arriving after bluetoothd has started can land present but
+    # powered down -- the exact failure the recovery unit below has to undo by
+    # hand. Loading first keeps the ordinary path ordinary.
+    #
+    # Eight seconds is a guess, not a measurement: it is comfortably past the
+    # 6.6 s that failed and well short of the 50 s that worked, and nothing
+    # here needs Bluetooth sooner. The delay is paid on every boot, including
+    # the four in five that would have succeeded anyway, which is the price of
+    # not having to detect the failure first.
+    script = ''
+      sleep 8
+      modprobe hci_uart || true
+    '';
+  };
+
   # The Bluetooth controller on this machine is a Broadcom BCM4350C0 hanging off
   # a UART (dw-apb-uart -> serial0-0 -> hci_uart_bcm), not USB, and its setup
   # handshake is unreliable. Apple's ACPI tables do not expose the chip's reset
@@ -1484,14 +1543,35 @@ in
         busctl --system tree org.bluez 2>/dev/null | grep -q '/org/bluez/hci'
       }
 
-      # bluetoothd publishes the adapter a moment after the service reports
-      # started, so a single immediate check would misfire on a healthy boot.
-      for _ in $(seq 1 10); do
+      # The driver says so itself when setup aborts, so there is no need to
+      # wait out a timeout to infer it. -110 (ETIMEDOUT) specifically: that is
+      # the chip not answering at all. The -16 (EBUSY) spelling of the same
+      # message is the *healthy* path -- the command bounces immediately, the
+      # driver shrugs, and the adapter registers -- so matching the bare
+      # string would misfire on every good boot.
+      setup_failed() {
+        dmesg 2>/dev/null |
+          grep -qE "BCM: Reset failed \(-110\)|BCM: failed to write update baudrate \(-110\)"
+      }
+
+      # Poll at 200 ms instead of a fixed wait. bluetoothd publishes the
+      # adapter a moment after the service reports started, so an immediate
+      # single check would misfire on a healthy boot -- but once either the
+      # adapter is up or the driver has logged ETIMEDOUT, there is nothing
+      # left to wait for.
+      #
+      # have_adapter is checked first on every pass so a stale failure from an
+      # earlier boot-time reload cannot trigger a second re-probe.
+      for _ in $(seq 1 75); do
         have_adapter && break
-        sleep 1
+        setup_failed && break
+        sleep 0.2
       done
 
+      intervened=no
+
       if ! have_adapter; then
+        intervened=yes
         echo "no bluetooth adapter on the bus; re-probing hci_uart"
         rfkill unblock bluetooth || true
         modprobe -r hci_uart || true
@@ -1513,14 +1593,25 @@ in
       # the adapter appears in the normal way. One that arrives late, from the
       # reload above or from a soft-block being cleared, can land powered down
       # -- observed exactly that after a manual recovery: adapter present,
-      # Powered false, discovery silently finding nothing. Setting it here is
-      # idempotent and only ever runs at boot, so it cannot fight a radio the
-      # user switches off later.
-      adapter=$(busctl --system tree org.bluez 2>/dev/null |
-        grep -oE '/org/bluez/hci[0-9]+' | head -1)
-      if [ -n "$adapter" ]; then
-        busctl --system set-property org.bluez "$adapter" \
-          org.bluez.Adapter1 Powered b true || true
+      # Powered false, discovery silently finding nothing.
+      #
+      # Gated on having actually re-probed. Now that bluetooth-uart-delayed-load
+      # gets the adapter up before bluetoothd starts, the ordinary path is the
+      # normal one again and AutoEnable does this by itself -- forcing it here
+      # anyway just raced bluetoothd's own initialisation and logged
+      #
+      #   Failed to set property Powered on interface org.bluez.Adapter1:
+      #
+      # with an empty error, on a boot where the adapter was already powered.
+      # Harmless, but it is noise in exactly the place someone would look when
+      # Bluetooth is genuinely broken.
+      if [ "$intervened" = yes ]; then
+        adapter=$(busctl --system tree org.bluez 2>/dev/null |
+          grep -oE '/org/bluez/hci[0-9]+' | head -1)
+        if [ -n "$adapter" ]; then
+          busctl --system set-property org.bluez "$adapter" \
+            org.bluez.Adapter1 Powered b true || true
+        fi
       fi
     '';
   };
@@ -1582,7 +1673,7 @@ in
     after = [ "NetworkManager.service" ];
     wants = [ "NetworkManager.service" ];
     wantedBy = [ "multi-user.target" ];
-    path = with pkgs; [ kmod coreutils ];
+    path = with pkgs; [ kmod coreutils util-linux ];
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;
@@ -1593,6 +1684,15 @@ in
           [ -e "$w" ] && return 0
         done
         return 1
+      }
+
+      # brcmfmac announces its own failure, so there is no reason to sit out a
+      # fixed timeout waiting to infer it. Both spellings are matched because
+      # the chip recognition failure is the specific symptom seen here and the
+      # probe failure is the general one -- either is grounds to act.
+      probe_failed() {
+        dmesg 2>/dev/null |
+          grep -qE "brcmf_pcie_probe: failed|brcmf_chip_recognition: MMIO read failed"
       }
 
       # Broadcom (0x14e4) network controller (class 0x028000). Deliberately not
@@ -1607,13 +1707,30 @@ in
         return 1
       }
 
-      # brcmfmac loads and probes a couple of seconds into boot, so an
-      # immediate single check would misfire on a perfectly healthy boot.
-      for _ in $(seq 1 10); do
-        have_wifi && break
-        sleep 1
+      # Poll at 200 ms rather than waiting out a fixed delay. Both of the
+      # decided outcomes are usually already true by the time this unit runs
+      # -- a healthy boot has the interface, and a failed one has logged the
+      # failure -- so in practice this exits on the first iteration either
+      # way. The loop only ever spins in the narrow window where brcmfmac has
+      # not reported one way or the other yet.
+      #
+      # This is what took the observed cost of a failed boot from about
+      # thirteen seconds down to roughly two: the old version blocked for ten
+      # seconds to conclude something the kernel log already said at 6.8 s.
+      #
+      # have_wifi is checked before probe_failed on every pass, so a stale
+      # failure left in the ring buffer by an earlier recovery cannot trigger
+      # a second, pointless remove/rescan.
+      for _ in $(seq 1 75); do
+        have_wifi && exit 0
+        probe_failed && break
+        sleep 0.2
       done
 
+      # Falling out of the loop without a logged failure still means fifteen
+      # seconds with no interface. Re-enumerating is the same last resort the
+      # fixed-delay version applied, and it is harmless when the device is
+      # genuinely absent -- find_wifi_pci below simply finds nothing.
       if have_wifi; then
         exit 0
       fi
