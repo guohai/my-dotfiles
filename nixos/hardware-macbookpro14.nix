@@ -381,6 +381,41 @@ in
   # suspend having happened. Replaces the throwaway /tmp script.
   environment.systemPackages = [ applespiRebind kbdBacklightAls kbdBacklightInhibit ];
 
+  # --- Internal speakers: replace the mainline CS8409 codec driver ---
+  #
+  # The built-in speakers have never produced sound on this machine. Not a
+  # configuration problem -- PipeWire, WirePlumber, Chrome and ALSA are all
+  # provably fine, and writing pink noise straight to hw:0,0 with PipeWire's
+  # card profile set to off was equally silent. Bluetooth output works, which
+  # is what confines the fault to the codec itself. See the derivation for the
+  # full elimination.
+  #
+  # Mainline binds the CS8409 and parses it correctly but never programs the
+  # amplifier chips Apple wired downstream of it, so the whole chain reports
+  # success into a dead speaker. davidjo/snd_hda_macbookpro is the driver that
+  # knows those amps.
+  #
+  # kernelPackages.callPackage rather than pkgs.callPackage: it passes the
+  # kernel this configuration is actually booting, so the module is rebuilt
+  # automatically against every kernel bump instead of being pinned to one and
+  # silently failing to load after an upgrade. That is the whole reason to do
+  # this here rather than with DKMS, which is what the upstream instructions
+  # assume.
+  #
+  # The module installs to updates/codecs/cirrus rather than over the in-tree
+  # one. depmod searches updates/ first, so the replacement wins the
+  # hdaudio:v10138409r*a01* alias and the original stays untouched -- verified
+  # by running depmod over a merged tree and checking modules.dep listed only
+  # the updates/ path.
+  #
+  # Out-of-tree, so it can break on a kernel bump. Upstream tracks mainline
+  # closely (it handled the 6.17 sound/hda reorganisation and claims 7.0), but
+  # if audio dies after an upgrade this is the first thing to suspect: the
+  # build failing is loud, the module failing to load is not.
+  boot.extraModulePackages = [
+    (config.boot.kernelPackages.callPackage ./pkgs/snd-hda-codec-cs8409-apple.nix { })
+  ];
+
   # Handshake point between the root daemon and the user session. root:users
   # 0775 so swayidle, running as the logged-in user, can create and remove the
   # flag inside it without any of this needing sudo, a setuid binary or a
