@@ -2066,6 +2066,41 @@ in
   # Configure network connections interactively with nmcli or nmtui.
   networking.networkmanager.enable = true;
 
+  # Hand DNS to systemd-resolved rather than openresolv. This is here for
+  # NetBird's sake, not for DNSSEC or DNS-over-TLS.
+  #
+  # NetBird picks a DNS backend at startup by sniffing /etc/resolv.conf
+  # (client/internal/dns/host_unix.go, "resolvconf header detected"). Given
+  # openresolv it registers wt0 *exclusively* -- the marker is a file literally
+  # named /run/resolvconf/exclusive/"9999999 wt0" -- which makes its own
+  # resolver the only nameserver on the box. Everything outside netbird.cloud
+  # is then forwarded to whatever upstream NetBird captured at boot and saved
+  # in /etc/resolv.conf.original.netbird, and that upstream is never refreshed.
+  #
+  # Carry the laptop to another network and every public name dies while
+  # routing stays perfect, which is a memorably confusing failure: ping 8.8.8.8
+  # fine, ping a hostname "Temporary failure in name resolution". NetworkManager
+  # does register the new DHCP nameserver, correctly and promptly -- `resolvconf
+  # -l` shows it -- but exclusive mode hides it, and NetBird sits there
+  # forwarding to the previous network's router until each query times out.
+  #
+  # resolved fixes this by being per-link. NetBird registers its resolver on
+  # wt0 with a *routing* domain (~netbird.cloud) rather than seizing the whole
+  # stack, so netbird.cloud names go to NetBird and nothing else does.
+  # NetworkManager feeds resolved the live DHCP nameserver per link and re-feeds
+  # it on every change, so there is no captured upstream left to go stale. The
+  # nixpkgs NetBird module makes this structural rather than a matter of taste:
+  # it only puts openresolv on the daemon's PATH when resolved is disabled, so
+  # with resolved on, the exclusive path is not reachable at all.
+  #
+  # services.resolved also sets networking.resolvconf.enable = false and points
+  # /etc/resolv.conf at the stub resolver, which in turn flips NetworkManager's
+  # rc-manager to "unmanaged". dns is set explicitly below rather than left at
+  # "default" so the backend is stated in the config instead of inferred from
+  # whichever daemon happens to be running.
+  services.resolved.enable = true;
+  networking.networkmanager.dns = "systemd-resolved";
+
   # --- NetBird (netbird.io) ---
   # WireGuard-based mesh VPN. `enable = true` is the module's backward-compatible
   # single-client shortcut and is exactly equivalent to:
@@ -2077,17 +2112,27 @@ in
   # (clients.<name>.openFirewall defaults to true) so peers on the same LAN or
   # with a public IP can talk directly instead of relaying through TURN.
   #
-  # Deliberately NOT using `hardened = true` (which is the default when you
-  # declare a client explicitly). Hardened mode runs the daemon as a system user
-  # under `ProtectSystem = "strict"`, which makes /etc read-only. NetBird has to
-  # publish the netbird DNS zone somehow, and the hardened path assumes
-  # systemd-resolved -- the module's polkit grants for org.freedesktop.resolve1.*
-  # are all `mkIf config.services.resolved.enable`. On this machine resolved is
-  # inactive and DNS is openresolv writing /etc/resolv.conf, which a strict-/etc
-  # service cannot do. Running unhardened keeps the daemon as root so resolvconf
-  # works. Trade-off: the daemon control socket is not group-restricted, so any
-  # local user can drive the VPN -- acceptable on a single-user laptop. To harden
-  # later, enable services.resolved and set hardened = true.
+  # Still NOT using `hardened = true` (which is the default when you declare a
+  # client explicitly), but the reason is now a much smaller one than it was.
+  #
+  # The old blocker is gone. Hardened mode runs the daemon as a system user
+  # under `ProtectSystem = "strict"`, which makes /etc read-only, and that was
+  # flatly incompatible with a DNS stack where NetBird published the netbird
+  # zone by writing /etc/resolv.conf through openresolv. With resolved enabled
+  # above it publishes over the resolve1 D-Bus API instead, and the module's
+  # polkit grants for org.freedesktop.resolve1.* -- all of them `mkIf
+  # config.services.resolved.enable` -- are live as a result. Hardening is
+  # therefore available now. (Unhardened the daemon runs as root and bypasses
+  # polkit anyway, so those grants only start mattering when this flips.)
+  #
+  # It is deferred purely to keep the resolved switch a single change: flipping
+  # both at once means any DNS failure afterwards could be the new backend or
+  # the new user and sandbox, with no way to tell which without unpicking them
+  # one at a time regardless. Flip this once resolved is confirmed good.
+  #
+  # What hardening actually buys here is the control socket. Today it is not
+  # group-restricted, so any local user can drive the VPN -- acceptable on a
+  # single-user laptop, and the reason this has been left alone twice now.
   services.netbird.enable = true;
 
   # Accept network routes advertised by other peers (e.g. a peer exposing a home

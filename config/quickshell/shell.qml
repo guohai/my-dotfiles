@@ -172,6 +172,247 @@ ShellRoot {
         }
     }
 
+    // ---- system info ----------------------------------------------------
+    // Everything the system page shows, gathered by two shell scripts rather
+    // than a drawer full of FileViews. Most of these are one-line sysfs files
+    // that only mean something in combination -- the GPU name is two PCI ids
+    // read out of sysfs and then handed to hwdb, battery health is two files
+    // divided by each other -- and a FileView each would put that stitching in
+    // QML with nothing ordering the loads against one another.
+    //
+    // Static and volatile are split because almost none of this moves. Model,
+    // CPU, kernel, firmware are fixed until reboot and are read once; battery,
+    // uptime, load and disk are re-read on a timer that only runs while the
+    // page is open.
+    //
+    // Both scripts are template literals: do not write a ${ inside one. That is
+    // JS interpolation and the shell never sees it. $( and $(( are fine.
+    Scope {
+        id: info
+
+        property var stat: ({})
+        property var live: ({})
+
+        // Battery comes from upower, not from sysfs, so this page and the bar
+        // cell cannot disagree -- see the long note on the battery cell.
+        //
+        // The kernel's own `capacity` attribute is the trap. On this battery it
+        // is charge_now/charge_full_design, so it reports how full the cell is
+        // as a fraction of what it held when new, and can never reach 100:
+        // 2316000/4790000 = 48% where upower says 60. Everything else that
+        // shows a battery percentage here divides by charge_full instead.
+        //
+        // Cycle count still comes from sysfs. upower does not expose it.
+        readonly property var bat: UPower.displayDevice
+        readonly property bool batPresent: bat && bat.isLaptopBattery
+
+        // Health has to come off the real BAT0 entry rather than displayDevice.
+        // displayDevice is a synthetic aggregate: it carries state, percentage
+        // and energy-full, but not energy-full-design, so healthSupported is
+        // false on it and healthPercentage reads 0. The percentage above still
+        // comes from displayDevice, because that is what the bar cell uses and
+        // the two have to agree.
+        //
+        // healthPercentage is on a 0-100 scale -- 80.02 here -- while
+        // percentage on the same object is 0-1. That asymmetry is upstream's,
+        // not a typo: do not "fix" one to match the other.
+        readonly property var batDev: {
+            const ds = UPower.devices ? UPower.devices.values : [];
+            for (const d of ds)
+                if (d.isLaptopBattery)
+                    return d;
+            return null;
+        }
+
+        // key=value, one per line. Split on the first = only -- the DMI strings
+        // and os-release values can contain their own.
+        function parse(t) {
+            const o = {};
+            for (const line of t.split("\n")) {
+                const i = line.indexOf("=");
+                if (i > 0)
+                    o[line.slice(0, i)] = line.slice(i + 1);
+            }
+            return o;
+        }
+
+        function gibN(kb) {
+            return (Number(kb) / 1048576).toFixed(1);
+        }
+
+        function gib(kb) {
+            return info.gibN(kb) + " GiB";
+        }
+
+        function dur(sec) {
+            const s = Number(sec);
+            const d = Math.floor(s / 86400);
+            const h = Math.floor(s % 86400 / 3600);
+            const m = Math.floor(s % 3600 / 60);
+            if (d > 0)
+                return d + "d " + h + "h";
+            return h > 0 ? h + "h " + m + "m" : m + "m";
+        }
+
+        // "Intel(R) Core(TM) i7-7660U CPU @ 2.50GHz" is the string the vendor
+        // put in cpuid, not a string anyone wants to read.
+        function cpuName(s) {
+            return s.replace(/\((R|TM)\)/g, "").replace(" CPU", "").replace(/\s+/g, " ").trim();
+        }
+
+        // hwdb answers with the full PCI database entry, "Kaby Lake-U GT3 [Iris
+        // Plus Graphics 640]". The bracketed half is the name the part is sold
+        // under; the rest is the die it happens to be cut from.
+        function gpuName(s) {
+            const m = s.match(/\[([^\]]+)\]/);
+            return m ? m[1] : s;
+        }
+
+        // Version strings carry a parenthetical saying who packaged them, which
+        // is the same answer for everything on this machine.
+        function short(s) {
+            return s.replace(/\s*\(.*\)\s*$/, "");
+        }
+
+        // DMI dates are US order and unlabelled, so 06/02/2023 is a coin flip
+        // between June and February until it is written out in full.
+        function isoDate(s) {
+            const m = s.match(/^(\d\d)\/(\d\d)\/(\d\d\d\d)$/);
+            return m ? m[3] + "-" + m[1] + "-" + m[2] : s;
+        }
+
+        // The two row lists the page renders. Built here rather than in the
+        // panel so the formatting lives next to the data it formats, and so a
+        // row whose source is missing drops out of the list entirely instead of
+        // rendering a label with nothing after it.
+        readonly property var hardware: {
+            const s = info.stat;
+            const v = info.live;
+            const r = [];
+            const add = (k, val) => {
+                if (val)
+                    r.push({
+                        k: k,
+                        v: val
+                    });
+            };
+
+            add("Model", s.model && s.vendor ? s.model + "   " + s.vendor : s.model);
+            add("CPU", s.cpu ? info.cpuName(s.cpu) + "   " + s.cores + " cores / " + s.threads + " threads" : "");
+            add("Graphics", s.gpu ? info.gpuName(s.gpu) : "");
+            add("Memory", s.memTotal ? info.gib(s.memTotal) + (Number(s.swapTotal) > 0 ? "   " + info.gib(s.swapTotal) + " swap" : "   no swap") : "");
+            add("Storage", s.diskModel);
+            add("Volume", s.rootFs && v.diskSize ? s.rootFs + "   " + info.gibN(v.diskUsed) + " of " + info.gib(v.diskSize) + " used (" + v.diskPct + ")" : s.rootFs);
+            add("Battery", info.batPresent ? Math.round(info.bat.percentage * 100) + "%   " + root.cap(UPowerDeviceState.toString(info.bat.state)) + (v.acOnline === "1" ? "   AC connected" : "") : "");
+            // Health and cycles are the thing this page exists to surface that
+            // nothing else on the bar does. Either half can be missing without
+            // taking the other with it.
+            const cond = [];
+            if (info.batDev && info.batDev.healthSupported)
+                cond.push(Math.round(info.batDev.healthPercentage) + "% of design capacity");
+            if (v.batCycles)
+                cond.push(v.batCycles + " cycles");
+            add("Condition", cond.join("   "));
+            add("Firmware", s.firmware ? s.firmware + (s.firmwareDate ? "   " + info.isoDate(s.firmwareDate) : "") : "");
+            return r;
+        }
+
+        readonly property var software: {
+            const s = info.stat;
+            const v = info.live;
+            const r = [];
+            const add = (k, val) => {
+                if (val)
+                    r.push({
+                        k: k,
+                        v: val
+                    });
+            };
+
+            add("OS", s.os);
+            // The nixpkgs revision the running system was built from. This is
+            // the only version here that identifies an exact tree rather than a
+            // release, so it is the one to quote in a bug report.
+            add("Build", s.build);
+            add("Kernel", s.kernel);
+            add("Compositor", s.compositor ? info.short(s.compositor) : "");
+            add("Shell", s.shell ? info.short(s.shell) : "");
+            add("Hostname", s.host);
+            add("Uptime", v.uptime ? info.dur(v.uptime) : "");
+            add("Load", v.load);
+            return r;
+        }
+
+        Process {
+            id: statProc
+            running: true
+            command: ["sh", "-c", `
+d=/sys/devices/virtual/dmi/id
+echo "model=$(cat $d/product_name 2>/dev/null)"
+echo "vendor=$(cat $d/sys_vendor 2>/dev/null)"
+echo "firmware=$(cat $d/bios_version 2>/dev/null)"
+echo "firmwareDate=$(cat $d/bios_date 2>/dev/null)"
+echo "cpu=$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo)"
+echo "cores=$(awk -F': ' '/^cpu cores/{print $2; exit}' /proc/cpuinfo)"
+echo "threads=$(grep -c ^processor /proc/cpuinfo)"
+echo "memTotal=$(awk '/^MemTotal/{print $2; exit}' /proc/meminfo)"
+echo "swapTotal=$(awk '/^SwapTotal/{print $2; exit}' /proc/meminfo)"
+c=$(ls -d /sys/class/drm/card[0-9] 2>/dev/null | head -1)
+if [ -n "$c" ]; then
+  id="pci:v0000$(cut -c3- $c/device/vendor | tr a-f A-F)d0000$(cut -c3- $c/device/device | tr a-f A-F)"
+  echo "gpu=$(systemd-hwdb query "$id" 2>/dev/null | sed -n 's/^ID_MODEL_FROM_DATABASE=//p')"
+fi
+for n in /sys/class/nvme/nvme*/model /sys/block/sd*/device/model; do
+  if [ -r "$n" ]; then echo "diskModel=$(sed 's/ *$//' $n)"; break; fi
+done
+echo "rootFs=$(findmnt -no SOURCE,FSTYPE / 2>/dev/null | awk '{print $1"   "$2}')"
+echo "host=$(cat /proc/sys/kernel/hostname)"
+echo "kernel=$(cat /proc/sys/kernel/osrelease)"
+echo "os=$(. /etc/os-release; echo $PRETTY_NAME)"
+echo "build=$(. /etc/os-release; echo $BUILD_ID)"
+echo "compositor=$(niri --version 2>/dev/null | head -1)"
+echo "shell=$(quickshell --version 2>/dev/null | head -1)"
+`]
+            stdout: StdioCollector {
+                onStreamFinished: info.stat = info.parse(text)
+            }
+        }
+
+        Process {
+            id: liveProc
+            // Runs once at startup as well as on the timer, so the first open
+            // of the page is already populated rather than filling in a frame
+            // later.
+            running: true
+            command: ["sh", "-c", `
+echo "uptime=$(awk '{print int($1)}' /proc/uptime)"
+echo "load=$(awk '{print $1"   "$2"   "$3}' /proc/loadavg)"
+b=$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -1)
+if [ -n "$b" ]; then
+  echo "batCycles=$(cat $b/cycle_count 2>/dev/null)"
+fi
+for a in /sys/class/power_supply/A*/online; do
+  if [ -r "$a" ]; then echo "acOnline=$(cat $a)"; break; fi
+done
+df -P / 2>/dev/null | awk 'NR==2{print "diskSize="$2; print "diskUsed="$3; print "diskPct="$5}'
+`]
+            stdout: StdioCollector {
+                onStreamFinished: info.live = info.parse(text)
+            }
+        }
+
+        Timer {
+            // Only while the page is open. None of this is shown anywhere else,
+            // so polling it closed would be a process every five seconds for
+            // something nobody can see.
+            interval: 5000
+            running: root.openPanel === "system"
+            repeat: true
+            triggeredOnStart: true
+            onTriggered: liveProc.running = true
+        }
+    }
+
     // ---- world clock ----------------------------------------------------
     // QML's JS engine has no Intl, and its toLocaleString silently ignores the
     // timeZone option (it returns local time), so neither can do this. Shell
@@ -277,6 +518,163 @@ ShellRoot {
                 pskTarget = n;
             }
         }
+
+        // ---- DNS override ---------------------------------------------------
+        // Which resolver the *active wifi profile* is pinned to. The override
+        // lives on the NetworkManager connection, not here and not in
+        // /etc/resolv.conf, which buys two things: it survives reboots, and it
+        // is remembered per network, so "Cloudflare at the office, DHCP at
+        // home" needs no thought after the first time.
+        //
+        // Nothing in here touches NetBird. It edits one wifi connection
+        // profile; NetBird's own registration on wt0 is a separate link and is
+        // left exactly alone.
+        property string dnsMode: "dhcp"
+        property string dnsEffective: ""
+        property string dnsCustom: ""
+        property bool dnsResolving: true
+        property bool dnsBusy: false
+
+        // Address as this machine sees it, and as the internet sees it. The
+        // pair is the useful bit: equal means no NAT, different is the normal
+        // case, and "local set, public blank" is a good first sign that the
+        // way out is broken rather than the link.
+        property string localAddr: ""
+        property string publicAddr: ""
+
+        // Two addresses per provider rather than one: with a single nameserver
+        // any dropped packet is a failed lookup instead of a retry.
+        readonly property var dnsPresets: ({
+            "google": "8.8.8.8,8.8.4.4",
+            "cloudflare": "1.1.1.1,1.0.0.1"
+        })
+
+        function dnsServersFor(mode) {
+            if (mode === "dhcp")
+                return "";
+            if (mode === "custom")
+                return net.dnsCustom.trim().replace(/[\s,]+/g, ",");
+            return net.dnsPresets[mode] ?? "";
+        }
+
+        function dnsApply(mode) {
+            const servers = net.dnsServersFor(mode);
+            // Custom with an empty field is a no-op, not a silent reset to
+            // DHCP -- clicking the chip to reveal the input would otherwise
+            // wipe the override before anything had been typed into it.
+            if (mode === "custom" && servers === "")
+                return;
+            net.dnsBusy = true;
+            dnsWriteProc.servers = servers;
+            dnsWriteProc.running = true;
+        }
+
+        Process {
+            id: dnsWriteProc
+
+            // Passed through the environment rather than interpolated into the
+            // script. The Custom field is free text, and "1.1.1.1; rm -rf ~"
+            // pasted into a string that becomes `sh -c` is a real hole, not a
+            // theoretical one. As an env var it is data to nmcli and nothing
+            // else can see it.
+            property string servers: ""
+            environment: ({
+                "DNSSERVERS": servers
+            })
+
+            command: ["sh", "-c", `
+u=$(nmcli -t -g UUID,TYPE con show --active | awk -F: '$2=="802-11-wireless"{print $1; exit}')
+d=$(nmcli -t -g DEVICE,TYPE con show --active | awk -F: '$2=="802-11-wireless"{print $1; exit}')
+[ -z "$u" ] && exit 1
+if [ -z "$DNSSERVERS" ]; then
+  nmcli con modify "$u" ipv4.dns "" ipv4.ignore-auto-dns no
+else
+  nmcli con modify "$u" ipv4.dns "$DNSSERVERS" ipv4.ignore-auto-dns yes
+fi
+# reapply pushes the changed IP config onto the live device without tearing
+# the association down; con up is the fallback for the cases it refuses
+# (it drops the link for a moment, which is why it is not the first choice).
+nmcli dev reapply "$d" >/dev/null 2>&1 || nmcli con up "$u" >/dev/null 2>&1
+`]
+
+            onExited: dnsReadProc.running = true
+        }
+
+        Process {
+            id: dnsReadProc
+
+            // Read back rather than trusting what we just wrote, so the chips
+            // stay honest if the profile is edited from nmtui or nmcli behind
+            // the panel's back.
+            command: ["sh", "-c", `
+u=$(nmcli -t -g UUID,TYPE con show --active | awk -F: '$2=="802-11-wireless"{print $1; exit}')
+d=$(nmcli -t -g DEVICE,TYPE con show --active | awk -F: '$2=="802-11-wireless"{print $1; exit}')
+[ -z "$u" ] && exit 0
+echo "dns=$(nmcli -t -g ipv4.dns con show "$u")"
+# resolvectl first, because once resolved is running it is the only one that
+# knows the *per-link* answer. Falling back on an empty result rather than on
+# "is the binary present" is deliberate: resolvectl ships on this system
+# whether or not resolved is enabled, so testing for the binary would pick a
+# branch that silently returns nothing.
+eff=$(resolvectl dns "$d" 2>/dev/null | sed 's/^Link [0-9]* ([^)]*): *//')
+if [ -z "$eff" ]; then
+  # nmcli -t joins a multi-valued field with " | ", which reads as a column
+  # rule rather than a separator once it is sitting in a panel. Both branches
+  # come out space-separated.
+  eff=$(nmcli -t -g IP4.DNS dev show "$d" 2>/dev/null | awk '{printf "%s ", $0}' | sed 's/ *| */ /g')
+fi
+echo "eff=$eff"
+echo "local=$(nmcli -t -g IP4.ADDRESS dev show "$d" 2>/dev/null | head -1)"
+# End to end through the real resolver chain, NetBird included -- the point
+# is to catch "connected but nothing resolves", which is exactly the state a
+# reachable-looking nameserver can still leave you in.
+if timeout 3 getent hosts example.com >/dev/null 2>&1; then echo "ok=1"; else echo "ok=0"; fi
+`]
+
+            stdout: StdioCollector {
+                onStreamFinished: {
+                    const o = info.parse(text);
+                    net.dnsEffective = (o.eff ?? "").trim();
+                    net.localAddr = (o.local ?? "").trim();
+                    net.dnsResolving = o.ok === "1";
+
+                    const dns = o.dns ?? "";
+                    if (dns === "")
+                        net.dnsMode = "dhcp";
+                    else if (dns === net.dnsPresets["google"])
+                        net.dnsMode = "google";
+                    else if (dns === net.dnsPresets["cloudflare"])
+                        net.dnsMode = "cloudflare";
+                    else {
+                        net.dnsMode = "custom";
+                        net.dnsCustom = dns;
+                    }
+                    net.dnsBusy = false;
+                }
+            }
+        }
+
+        Process {
+            id: publicIpProc
+
+            // The only thing in this file that talks to a machine outside the
+            // network, which is unavoidable: the public address is by
+            // definition something only an outside observer can report. Kept
+            // deliberately cheap and infrequent -- see the timer for cadence.
+            //
+            // Two providers because one is a single point of failure for a
+            // cosmetic field, and -f so an HTTP error page becomes an empty
+            // string rather than being printed as if it were an address.
+            command: ["sh", "-c", `
+ip=$(curl -sf --max-time 4 https://icanhazip.com 2>/dev/null)
+[ -z "$ip" ] && ip=$(curl -sf --max-time 4 https://api.ipify.org 2>/dev/null)
+echo "public=$(echo "$ip" | tr -d '[:space:]')"
+`]
+
+            stdout: StdioCollector {
+                onStreamFinished: net.publicAddr = (info.parse(text).public ?? "").trim()
+            }
+        }
     }
 
     // Scan only while the picker is open. A scan wakes the radio and costs
@@ -288,6 +686,37 @@ ShellRoot {
         property: "scannerEnabled"
         value: root.openPanel === "wifi"
         when: net.dev !== null
+    }
+
+    // Same reasoning as the scan above: only while the panel is open. Each tick
+    // shells out to nmcli twice and makes a real DNS query, which is not
+    // something to be doing every five seconds for a panel nobody is looking
+    // at. triggeredOnStart so opening the picker shows current state rather
+    // than the state from whenever it was last closed.
+    Timer {
+        interval: 5000
+        running: root.openPanel === "wifi"
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: dnsReadProc.running = true
+    }
+
+    // The public address gets its own timer rather than riding the one above,
+    // because it is the one lookup that leaves the machine. Five seconds would
+    // be a request to a third party every five seconds for a number that
+    // changes when the network does and not otherwise; five minutes is enough
+    // to notice a change while the panel sits open.
+    //
+    // The short interval is the retry path: an empty result means the last
+    // attempt failed, and a failed attempt is usually a connection that just
+    // came up and has not settled, which is worth asking about again sooner
+    // than five minutes.
+    Timer {
+        interval: net.publicAddr === "" ? 30000 : 300000
+        running: root.openPanel === "wifi"
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: publicIpProc.running = true
     }
 
     // ---- bluetooth ------------------------------------------------------
@@ -972,6 +1401,31 @@ ShellRoot {
                 // have shown the same picture twice. The Octicon processor and
                 // the Material expansion card below are different silhouettes:
                 // a square versus a horizontal stick.
+                // System page. First in the row, so the three live percentages
+                // that follow read as the running state of the machine this
+                // cell describes.
+                //
+                // nf-md-server: three stacked units, solid rather than outlined,
+                // so it carries weight next to the thin glyphs around it. Every
+                // other candidate collided with something already in this row --
+                // a chip with the CPU glyph next to it, an expansion card with
+                // the RAM stick, a laptop or a tower with the monitor further
+                // along. Stacked racks are the one shape here that is not a
+                // picture of a single component.
+                IconCell {
+                    glyph: root.icon(0xF048B)
+                    value: ""
+                    tint: root.openPanel === "system" ? root.accent : root.fg
+
+                    MouseArea {
+                        anchors.fill: parent
+                        // onPressed for the same reason as the wifi cell: an
+                        // open picker holds the keyboard, and pressing any bar
+                        // cell cancels the pointer grab before onClicked fires.
+                        onPressed: root.openPanel = root.openPanel === "system" ? "" : "system"
+                    }
+                }
+
                 IconCell {
                     glyph: root.icon(0xF4BC)
                     value: sys.cpuPct.toFixed(0) + "%"
@@ -1142,10 +1596,22 @@ ShellRoot {
                     readonly property int count: disp.list.length
 
                     tint: count > 1 || root.openPanel === "display" ? root.accent : root.fg
-                    // nf-md-monitor / nf-md-monitor_multiple. Two monitors are
-                    // drawn as two overlapping screens, which is legible at bar
-                    // size in a way a "2" next to one screen would not be.
-                    glyph: root.icon(count > 1 ? 0xF0382 : 0xF0379)
+                    // nf-md-television for one, nf-md-monitor_multiple for
+                    // several. Two monitors are drawn as two overlapping
+                    // screens, which is legible at bar size in a way a "2" next
+                    // to one screen would not be.
+                    //
+                    // television rather than nf-md-monitor for the single case:
+                    // monitor hangs its screen on a narrow pedestal stand, which
+                    // at 18px reads as an all-in-one computer rather than as a
+                    // display. television is the same screen on a flat foot and
+                    // stays a screen.
+                    //
+                    // 0xF0382 was here for the multiple case and is not
+                    // monitor_multiple -- it renders as an asterisk. Nothing
+                    // caught it because it only appears with two displays
+                    // attached. The real codepoint is one past monitor.
+                    glyph: root.icon(count > 1 ? 0xF037A : 0xF0502)
                     value: ""
 
                     MouseArea {
@@ -1280,6 +1746,40 @@ ShellRoot {
         color: root.dim
         font.family: root.mono
         font.pixelSize: 11
+    }
+
+    // A label and its value on one line, for pages that are read rather than
+    // clicked. The label column is a fixed width so the values line up down the
+    // page; the value elides instead of wrapping, because each one is a single
+    // identifier and a truncated identifier is easier to scan past than one
+    // broken across two lines.
+    component InfoRow: Row {
+        id: infoRow
+        property string label
+        property string value
+        // 92 suits the 530px system page. The wifi picker is 380 and its
+        // labels are one word, so it passes something narrower rather than
+        // spending a quarter of the panel on whitespace.
+        property int labelWidth: 92
+
+        height: 18
+
+        Text {
+            width: infoRow.labelWidth
+            text: infoRow.label
+            color: root.dim
+            font.family: root.mono
+            font.pixelSize: 12
+        }
+
+        Text {
+            width: infoRow.width - infoRow.labelWidth
+            text: infoRow.value
+            elide: Text.ElideRight
+            color: root.fg
+            font.family: root.mono
+            font.pixelSize: 12
+        }
     }
 
     // A chip in a segmented row -- scale factors, brightness steps. Used where
@@ -1536,6 +2036,145 @@ ShellRoot {
                 }
             }
 
+            // Everything about the connection you already have, above the list
+            // of ones you do not. The list is the long, scrolling, variable
+            // part of this panel; putting the current addresses and the DNS
+            // override underneath it means scrolling past the answer to reach
+            // it, and on a busy network the answer is off the bottom entirely.
+            //
+            // The DNS chips are the manual half of the story. The automatic
+            // half is services.resolved in configuration.nix, which is what
+            // makes the nameserver follow the network by itself. These are for
+            // when the network's own resolver is present and reachable but not
+            // one you want to use -- a captive portal, a hotel, an office that
+            // blackholes half the internet.
+            Column {
+                id: connCol
+                width: wifiCol.width
+                spacing: 4
+
+                // Either source is enough. net.active comes from the
+                // Quickshell.Networking D-Bus binding, which is instant but
+                // goes stale if NetworkManager restarts under a running shell
+                // -- a `nixos-rebuild switch` does exactly that, and the
+                // binding does not reconnect, so devices silently empties and
+                // the whole panel reads as "not connected" until the shell is
+                // restarted. localAddr comes from nmcli in a subprocess, which
+                // cannot go stale that way but takes a moment to arrive.
+                //
+                // Requiring both would mean this block vanishes on a stale
+                // binding, taking the DNS controls with it -- precisely when
+                // something is wrong with the network and they are wanted.
+                visible: net.active !== null || net.localAddr !== ""
+
+                // 56 rather than the 92 the system page uses -- see InfoRow.
+                InfoRow {
+                    width: connCol.width
+                    labelWidth: 56
+                    label: "Local"
+                    value: net.localAddr
+                    // An empty row says "no address yet" more honestly than a
+                    // placeholder does, and takes up no height saying it.
+                    visible: net.localAddr !== ""
+                }
+
+                InfoRow {
+                    width: connCol.width
+                    labelWidth: 56
+                    label: "Public"
+                    // Blank means the last fetch failed, which on a connection
+                    // that is otherwise up almost always means DNS. Say that
+                    // rather than leaving an empty row that reads as "still
+                    // loading" forever.
+                    value: net.publicAddr !== "" ? net.publicAddr
+                        : (net.dnsResolving ? "checking..." : "unavailable")
+                }
+
+                PickerHeading { text: "DNS" }
+
+                Row {
+                    spacing: 4
+
+                    SegCell {
+                        label: "DHCP"
+                        active: net.dnsMode === "dhcp"
+                        available: !net.dnsBusy
+                        onActivated: net.dnsApply("dhcp")
+                    }
+
+                    SegCell {
+                        label: "Google"
+                        active: net.dnsMode === "google"
+                        available: !net.dnsBusy
+                        onActivated: net.dnsApply("google")
+                    }
+
+                    SegCell {
+                        label: "Cloudflare"
+                        active: net.dnsMode === "cloudflare"
+                        available: !net.dnsBusy
+                        onActivated: net.dnsApply("cloudflare")
+                    }
+
+                    SegCell {
+                        label: "Custom"
+                        active: net.dnsMode === "custom"
+                        available: !net.dnsBusy
+                        // Reveals the field instead of applying: there is
+                        // nothing to apply until something has been typed, and
+                        // applying an empty Custom would just be DHCP wearing
+                        // a different hat.
+                        onActivated: {
+                            net.dnsMode = "custom";
+                            dnsField.forceActiveFocus();
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: parent.width
+                    height: 26
+                    visible: net.dnsMode === "custom"
+                    color: root.hover
+                    border.color: dnsField.activeFocus ? root.accent : "transparent"
+
+                    TextInput {
+                        id: dnsField
+                        anchors.fill: parent
+                        anchors.margins: 6
+                        verticalAlignment: TextInput.AlignVCenter
+                        color: root.fg
+                        font.family: root.mono
+                        font.pixelSize: 12
+                        selectByMouse: true
+                        text: net.dnsCustom
+                        // textEdited, not textChanged: this fires only for
+                        // typing, so the binding above can still push a value
+                        // in from the read-back without the two fighting.
+                        onTextEdited: net.dnsCustom = text
+                        onAccepted: net.dnsApply("custom")
+                    }
+                }
+
+                // The detect half: what is actually resolving, as opposed to
+                // what is configured. "connected, nameserver set, nothing
+                // resolves" is a state worth being able to see at a glance
+                // rather than deduce from a browser error.
+                Text {
+                    width: parent.width
+                    wrapMode: Text.Wrap
+                    color: net.dnsResolving ? root.dim : root.bad
+                    font.family: root.mono
+                    font.pixelSize: 11
+                    text: {
+                        if (net.dnsMode === "custom" && net.dnsCustom === "")
+                            return "Addresses separated by space or comma, Enter to apply";
+                        const via = net.dnsEffective !== "" ? net.dnsEffective : "unknown";
+                        return via + (net.dnsResolving ? " -- resolving" : " -- not resolving");
+                    }
+                }
+            }
+
             Repeater {
                 model: net.list
 
@@ -1613,9 +2252,23 @@ ShellRoot {
             // TextField, to avoid pulling the Controls style stack into the
             // shell for one widget.
             Column {
+                id: pskCol
                 width: wifiCol.width
                 spacing: 4
                 visible: net.pskTarget !== null
+
+                property bool showPsk: false
+
+                // One exit for both ways out of the prompt, so the reveal flag
+                // and the buffered passphrase can never drift apart. Clearing
+                // the text but not the flag is how the *next* network's prompt
+                // would open already unmasked, in whatever room the laptop
+                // happens to be open in.
+                function clear() {
+                    net.pskTarget = null;
+                    pskField.text = "";
+                    showPsk = false;
+                }
 
                 PickerHeading {
                     text: net.pskTarget ? "Password for " + net.pskTarget.name : ""
@@ -1635,7 +2288,7 @@ ShellRoot {
                         color: root.fg
                         font.family: root.mono
                         font.pixelSize: 12
-                        echoMode: TextInput.Password
+                        echoMode: pskCol.showPsk ? TextInput.Normal : TextInput.Password
                         selectByMouse: true
                         // Grab focus as soon as the prompt appears, so the
                         // passphrase can be typed without a second click.
@@ -1646,14 +2299,56 @@ ShellRoot {
                         onAccepted: {
                             if (net.pskTarget && text.length > 0) {
                                 net.pskTarget.connectWithPsk(text);
-                                net.pskTarget = null;
-                                text = "";
+                                pskCol.clear();
                             }
                         }
-                        Keys.onEscapePressed: {
-                            net.pskTarget = null;
-                            text = "";
+                        Keys.onEscapePressed: pskCol.clear()
+                    }
+                }
+
+                // Show-password toggle. Wrapped in an Item because the
+                // MouseArea has to cover the box and its label together: a
+                // MouseArea declared directly inside the Row would be laid out
+                // as a third column beside them rather than sitting on top.
+                Item {
+                    width: pskToggle.implicitWidth
+                    height: pskToggle.implicitHeight
+
+                    Row {
+                        id: pskToggle
+                        spacing: 6
+
+                        Rectangle {
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: 13
+                            height: 13
+                            radius: 2
+                            color: pskCol.showPsk ? root.accent : "transparent"
+                            border.width: 1
+                            border.color: pskCol.showPsk ? root.accent : root.dim
+
+                            Text {
+                                anchors.centerIn: parent
+                                visible: pskCol.showPsk
+                                // nf-md-check_bold, not nf-md-check: the plain
+                                // one is a hairline that vanishes at this size
+                                // against the accent fill.
+                                text: root.icon(0xF0E1E)
+                                color: root.bg
+                                font.family: root.mono
+                                font.pixelSize: 10
+                            }
                         }
+
+                        PickerHeading {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "Show password"
+                        }
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: pskCol.showPsk = !pskCol.showPsk
                     }
                 }
 
@@ -2146,6 +2841,80 @@ ShellRoot {
                     if (n === 0)
                         return "Nothing saved yet -- pick a resolution, scale or brightness and it will be reapplied when this monitor is next plugged in.";
                     return "Saved for " + n + " monitor" + (n === 1 ? "" : "s") + "; reapplied on plug-in.";
+                }
+            }
+        }
+    }
+
+    // System page: what this machine is, in hardware and in software.
+    //
+    // Screenless, unlike the display picker. Nothing on it is per monitor, so
+    // there is no monitor it would be wrong to open on.
+    PanelWindow {
+        visible: root.openPanel === "system"
+        WlrLayershell.layer: WlrLayer.Overlay
+        exclusionMode: ExclusionMode.Ignore
+        anchors {
+            top: true
+            right: true
+        }
+        margins {
+            top: 34
+            right: 8
+        }
+        implicitWidth: 530
+        implicitHeight: sysCol.implicitHeight + 20
+        color: root.bg
+
+        Column {
+            id: sysCol
+            anchors.fill: parent
+            anchors.margins: 10
+            // Between the two sections. The rows inside each are tighter --
+            // they are one table, not a list of separate facts.
+            spacing: 10
+
+            Column {
+                id: hwCol
+                width: sysCol.width
+                spacing: 2
+
+                PickerHeading {
+                    color: root.accent
+                    text: "Hardware"
+                }
+
+                Repeater {
+                    model: info.hardware
+
+                    InfoRow {
+                        required property var modelData
+                        width: hwCol.width
+                        label: modelData.k
+                        value: modelData.v
+                    }
+                }
+            }
+
+            Column {
+                id: swCol
+                width: sysCol.width
+                spacing: 2
+
+                PickerHeading {
+                    color: root.accent
+                    text: "Software"
+                }
+
+                Repeater {
+                    model: info.software
+
+                    InfoRow {
+                        required property var modelData
+                        width: swCol.width
+                        label: modelData.k
+                        value: modelData.v
+                    }
                 }
             }
         }
