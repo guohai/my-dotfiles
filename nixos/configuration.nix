@@ -1048,15 +1048,22 @@ in
           #   1. deep/S3 hung outright. `mem_sleep_default=s2idle` (see
           #      boot.kernelParams) switched it to the state this generation of
           #      MacBook actually uses.
+          #
+          #      Going back to deep is a recurring temptation, because s2idle is
+          #      what leaves the Thunderbolt controller wedged and deep would
+          #      hand it to firmware to re-initialise. Resist it: this is the
+          #      machine that produced five `suspend entry (deep)` lines and
+          #      zero exits. If it is ever tried anyway, use
+          #      `echo deep | sudo tee /sys/power/mem_sleep` and one manual
+          #      suspend rather than rebuilding -- that reverts on power-off,
+          #      which matters when the failure mode is a machine you cannot
+          #      log into.
           #   2. The Apple ANS2 NVMe controller was not being shut down on the
           #      s2idle path, so the disk came back wedged. See the
           #      nvme-no-d3cold unit further down.
           #   3. Suspend entry itself took 38-79s because the Intel LPSS SPI
           #      controller was runtime-suspending underneath the driver. See
           #      the udev rule in hardware-macbookpro14.nix.
-          #
-          # Re-enabled 2026-09-13 after `systemctl suspend` returned in 2.8s
-          # twice running, with matching `suspend exit (s2idle)` lines.
           #
           # If this ever starts losing sessions again, comment this block out
           # first -- it is the only thing that suspends the machine unattended,
@@ -1714,10 +1721,6 @@ in
       # way. The loop only ever spins in the narrow window where brcmfmac has
       # not reported one way or the other yet.
       #
-      # This is what took the observed cost of a failed boot from about
-      # thirteen seconds down to roughly two: the old version blocked for ten
-      # seconds to conclude something the kernel log already said at 6.8 s.
-      #
       # have_wifi is checked before probe_failed on every pass, so a stale
       # failure left in the ring buffer by an earlier recovery cannot trigger
       # a second, pointless remove/rescan.
@@ -1944,6 +1947,41 @@ in
     # that cannot come back.
     "nvme_core.default_ps_max_latency_us=0"
     "pcie_aspm=off"
+
+    # --- Resume latency for the Alpine Ridge Thunderbolt controller ---
+    #
+    # The Thunderbolt 3 controller does not survive s2idle. Going down, the
+    # kernel cannot reach it at all -- `tb_cfg_write: -108` (ESHUTDOWN) -- and
+    # its ports refuse to enter D3hot. Coming back they will not leave D3cold,
+    # so everything behind them is unreachable and the PCI core waits, doubling
+    # each time out to pci_dev_wait()'s 60s ceiling:
+    #
+    #   xhci_hcd 0000:07:00.0: not ready 65535ms after resume; giving up
+    #
+    # That happens to several devices, all in the noirq phase -- before
+    # interrupts are back, before i915 resumes the panel, before userspace is
+    # scheduled. So the whole machine is dark for minutes, keyboard backlight
+    # included, and no swayidle hook can help: after-resume fires on logind's
+    # PrepareForSleep(false), long after this is over.
+    #
+    # pcie_port_pm=off does not work by the mechanism its name suggests. The
+    # ports still reach D3cold. What changes is that pciehp reports "Card not
+    # present" and tears the device down immediately rather than waiting -- the
+    # kernel stops waiting, not failing. Resume goes from minutes to seconds.
+    #
+    # It does not make Thunderbolt survive suspend: 07:00.0 stays gone and
+    # usb3/usb4 are deregistered, so external USB-C is dead until reboot. That
+    # was equally true before -- the old behaviour was minutes of waiting and
+    # then the same dead controller. Internal USB (00:14.0) and the SPI
+    # keyboard are on other silicon and unaffected.
+    #
+    # Expect a harmless WARN at pci.c:2202 ("disabling already-disabled
+    # device") from the pciehp teardown.
+    #
+    # Not a fix for the controller, a way of never asking it the question. The
+    # heavier alternative is blacklisting the thunderbolt module, at the cost of
+    # Thunderbolt data.
+    "pcie_port_pm=off"
   ];
 
   # Keep the NVMe and the root port it hangs off out of D3cold. Linux cannot
@@ -2000,12 +2038,11 @@ in
     '';
   };
 
-  # Closing the lid suspends. This was "lock" for a while, as a stopgap while
-  # suspend was fatal on this machine -- a laptop that stays awake in a bag and
-  # runs itself flat was the lesser evil against one that loses the session
-  # outright. Restored to the normal behaviour 2026-09-13 once suspend was
-  # shown to return in ~2.8s; see the long note on the 900s swayidle timer
-  # above for the three defects that had to be fixed first.
+  # Closing the lid suspends. This depends on suspend actually working on this
+  # machine, which took three separate fixes -- see the long note on the 900s
+  # swayidle timer above. If suspend ever becomes fatal again, "lock" is the
+  # stopgap: a laptop that stays awake in a bag and runs itself flat is the
+  # lesser evil against one that loses the session outright.
   #
   # swayidle's before-sleep event is what puts the lock screen up, so the
   # screen is already locked before the machine goes down rather than after it

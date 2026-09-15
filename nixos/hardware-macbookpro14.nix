@@ -533,9 +533,8 @@ in
   # sleep, which gives the device another way to end up out of sync with the
   # driver.
   #
-  # Status: this started out as a speculative "removes a variable" rule and
-  # turned out to be load-bearing. Measured suspend entry -> exit, same kernel,
-  # same machine, on 2026-09-13:
+  # Load-bearing, not speculative. Measured suspend entry -> exit, same kernel,
+  # same machine:
   #
   #   00:38:14  power/control=auto   38.08s     <- config switched at 00:37:26,
   #   23:53:42  power/control=auto   78.83s        but an ACTION=="add" rule does
