@@ -60,6 +60,25 @@ ShellRoot {
     // popup so opening one always closes the others.
     property string openPanel: ""
 
+    // The niri output name of the bar whose cell was last pressed, or "" before
+    // anything has been pressed.
+    //
+    // Only the display picker reads it, for two things that have to agree: the
+    // monitor it lists first, and the monitor it opens on. Listing the one you
+    // are sitting in front of first is the point -- with an external attached,
+    // the settings you want are almost never the ones at the top of an
+    // arbitrarily ordered list. But ordering alone would be worse than nothing
+    // if the popup then opened on the other screen, so the window is pinned to
+    // the same output rather than left for the compositor to place.
+    //
+    // The bar is cloned per screen, so the cell that was pressed already knows
+    // which monitor it is on. That is a better answer than asking niri for the
+    // focused output: focus-follows-mouse is off in config.kdl, and a bar is a
+    // layer-shell surface that takes no keyboard focus, so pressing the display
+    // cell on the external monitor leaves focus wherever it was -- quite
+    // possibly the internal panel.
+    property string activeOutput: ""
+
     // Edit this list to change the world clock. Names are tz database zones;
     // `timedatectl list-timezones` prints the valid ones.
     readonly property var zones: [
@@ -382,11 +401,457 @@ ShellRoot {
         when: bt.adapter !== null
     }
 
+    // ---- displays -------------------------------------------------------
+    // Quickshell has no output-configuration module -- Quickshell.screens is
+    // read-only geometry, enough to place a bar on each monitor and nothing
+    // more -- so unlike every other picker here this one does shell out. niri
+    // owns mode, scale and position, and `niri msg` is its only public way in.
+    //
+    // The thing to know about `niri msg output` is in its own --help: "The
+    // configuration is changed temporarily and not saved into the config file.
+    // If the output configuration subsequently changes in the config file,
+    // these temporary changes will be forgotten." So niri deliberately does
+    // not remember. Anything set here survives until the next config reload or
+    // until the monitor is unplugged, and then it is gone.
+    //
+    // Hence the state file. Every change is written to
+    // ~/.local/state/quickshell/monitors.json keyed by the monitor itself, and
+    // replayed onto any output that turns up without those settings -- at
+    // startup and on every hotplug. That is what makes a monitor come back the
+    // way you left it.
+    //
+    // Keyed by make/model/serial rather than by connector name on purpose. The
+    // same monitor is DP-1 or DP-2 depending on which Thunderbolt port it
+    // landed in, so a connector-keyed file would forget everything the first
+    // time you used the other side of the laptop.
+    Scope {
+        id: disp
+
+        // Live, from niri. Array of its output objects, with .modes,
+        // .current_mode (an index into .modes) and .logical.scale.
+        property var outputs: []
+        // Remembered. key -> { mode, scale, brightness }.
+        property var saved: ({})
+        // niri output name -> ddcutil display number, from `ddcutil detect`.
+        // Absent means that monitor does not answer DDC and gets no
+        // brightness row.
+        property var ddc: ({})
+        // niri output name -> brightness percent, or absent if unknown.
+        property var bright: ({})
+
+        // Set once the state file has been read. Until then restore() must not
+        // run: an empty `saved` would look like "nothing remembered" and the
+        // first save() would then overwrite the real file with it.
+        property bool loaded: false
+
+        readonly property string statePath: Quickshell.env("HOME") + "/.local/state/quickshell/monitors.json"
+
+        // Every output, with the one the picker was opened from moved to the
+        // front. `niri msg outputs` returns an object keyed by connector, so
+        // the natural order is whatever the JSON happened to enumerate -- which
+        // is stable, but has nothing to do with which monitor you are looking
+        // at. The rest keep their relative order, so the list does not reshuffle
+        // beyond the single move.
+        readonly property var list: {
+            const arr = outputs ? Object.keys(outputs).map(k => outputs[k]) : [];
+            const want = root.activeOutput;
+            if (!want)
+                return arr;
+            const i = arr.findIndex(o => o.name === want);
+            // i === 0 is already correct; i === -1 means the bar's screen is not
+            // in niri's list, which happens for the moment between a monitor
+            // being unplugged and Quickshell.screens catching up.
+            return i > 0 ? [arr[i]].concat(arr.slice(0, i), arr.slice(i + 1)) : arr;
+        }
+
+        // What a monitor is, independently of where it is plugged in. Falls
+        // back to the connector name for a panel that reports no EDID strings
+        // at all -- worse than nothing to key on, but better than grouping
+        // every such monitor under one empty string.
+        function keyOf(o) {
+            const id = [o.make, o.model, o.serial].filter(s => s && s.length > 0).join(" ");
+            return id.length > 0 ? id : o.name;
+        }
+
+        // niri wants "5120x2160@30.000". refresh_rate is millihertz.
+        function modeStr(m) {
+            return m.width + "x" + m.height + "@" + (m.refresh_rate / 1000).toFixed(3);
+        }
+
+        function curMode(o) {
+            const m = o.modes[o.current_mode];
+            return m ? modeStr(m) : "";
+        }
+
+        // One entry per resolution, keeping the highest refresh rate offered
+        // for it. The ultrawide advertises 32 modes, most of them the same
+        // resolution at 60 / 59.94 / 50 / 30 / 24 -- a list nobody wants to
+        // read, and one where the 59.94 next to the 60 is a trap rather than a
+        // choice. Sorted by pixel count so the native mode is first.
+        //
+        // Anything under 1280 wide is dropped outright, at every expansion
+        // level. Those are the 800x600 and 720x480 legacy timings every EDID
+        // still carries, and picking one on a laptop with no other screen
+        // attached is a good way to need a terminal you can no longer read to
+        // undo it.
+        function allModes(o) {
+            const best = {};
+            for (const m of o.modes) {
+                if (m.width < 1280)
+                    continue;
+                const k = m.width + "x" + m.height;
+                if (!best[k] || m.refresh_rate > best[k].refresh_rate)
+                    best[k] = m;
+            }
+            const out = Object.keys(best).map(k => best[k]);
+            out.sort((a, b) => (b.width * b.height) - (a.width * a.height));
+            return out;
+        }
+
+        // 1080p and below is folded away behind a "show all" row. On this
+        // ultrawide that is nine of the thirteen surviving modes -- 1920x1080,
+        // 1680x1050, 1600x900, 1440x900, 1366x768, 1280x1024, 1280x800,
+        // 1280x720 and so on -- and none of them is a choice anyone plugging in
+        // a 5K monitor is looking for. They stay reachable because they are
+        // occasionally the point: driving a projector, or matching a capture
+        // device that only takes 1080p.
+        //
+        // Height, not pixel count. An ultrawide 2560x1080 is a 1080p panel in
+        // the sense that matters here -- the vertical resolution is what its
+        // name is about -- while 1440x1050 has fewer pixels and is not.
+        readonly property int collapseBelow: 1080
+
+        function modeList(o) {
+            const all = disp.allModes(o);
+            if (disp.expanded[o.name])
+                return all;
+            // The mode currently in use survives the filter whatever its size.
+            // Hiding it would leave the section with no highlighted row, which
+            // reads as "no resolution is set" rather than "the one you are
+            // using is further down".
+            const cur = disp.curMode(o);
+            const top = all.filter(m => m.height > disp.collapseBelow || disp.modeStr(m) === cur);
+            // A monitor whose native mode is itself 1080p would collapse to an
+            // empty list, which would leave the section with nothing to click.
+            return top.length > 0 ? top : all;
+        }
+
+        function hiddenCount(o) {
+            return disp.allModes(o).length - disp.modeList(o).length;
+        }
+
+        // Keyed by connector and held here rather than in the delegate: the
+        // Repeater's model is rebuilt on every refresh, and refresh runs each
+        // time the panel opens, so a bool living in the delegate would collapse
+        // itself the moment anything else changed.
+        property var expanded: ({})
+
+        function toggleExpanded(name) {
+            disp.expanded = Object.assign({}, disp.expanded, { [name]: !disp.expanded[name] });
+        }
+
+        // ---- talking to niri ----
+
+        property var queue: []
+        property bool busy: false
+
+        function run(cmd) {
+            disp.queue.push(cmd);
+            disp.pump();
+        }
+
+        function pump() {
+            if (disp.busy || disp.queue.length === 0) {
+                // Re-read only once the whole batch has landed. Refreshing
+                // after each command would race the next one and, because
+                // restore() runs off the refresh, could set a value back to
+                // what it was mid-batch.
+                if (!disp.busy && disp.queue.length === 0 && disp.pending) {
+                    disp.pending = false;
+                    disp.refresh();
+                }
+                return;
+            }
+            disp.busy = true;
+            cmdProc.command = disp.queue.shift();
+            cmdProc.running = true;
+        }
+
+        property bool pending: false
+
+        function niri(name, action, value) {
+            disp.pending = true;
+            disp.run(["niri", "msg", "output", name, action, String(value)]);
+        }
+
+        function refresh() {
+            outputsProc.running = true;
+        }
+
+        Process {
+            id: cmdProc
+            onExited: {
+                disp.busy = false;
+                disp.pump();
+            }
+        }
+
+        Process {
+            id: outputsProc
+            command: ["niri", "msg", "--json", "outputs"]
+            stdout: StdioCollector {
+                onStreamFinished: {
+                    try {
+                        disp.outputs = JSON.parse(text);
+                    } catch (e) {
+                        return;
+                    }
+                    disp.restore();
+                }
+            }
+        }
+
+        // ---- remembering ----
+
+        FileView {
+            id: stateFile
+            path: disp.statePath
+            // The file is ours alone and rewritten whole, so a partial write is
+            // the only corruption worth guarding against -- a truncated JSON
+            // would throw on the next parse and lose every monitor's settings
+            // at once.
+            atomicWrites: true
+            // Absent on a first run, which is not an error worth printing.
+            printErrors: false
+            // FileView caches by path for the life of the process, so without
+            // this an edit made outside the shell is never seen -- the cached
+            // copy is handed back on every reload. Found the hard way: the file
+            // was changed on disk, the shell reloaded, and it kept restoring
+            // the previous contents. It also makes hand-editing this file work,
+            // which is the only way to clear a remembered monitor.
+            watchChanges: true
+            onLoaded: {
+                try {
+                    disp.saved = JSON.parse(text()) || {};
+                } catch (e) {
+                    disp.saved = {};
+                }
+                disp.loaded = true;
+                disp.refresh();
+            }
+            onLoadFailed: {
+                disp.saved = {};
+                disp.loaded = true;
+                disp.refresh();
+            }
+        }
+
+        function remember(o, field, value) {
+            const k = disp.keyOf(o);
+            const entry = Object.assign({}, disp.saved[k] || {});
+            entry[field] = value;
+            // Reassign rather than mutate. QML tracks the property, not the
+            // object graph underneath it, so an in-place edit updates nothing
+            // bound to `saved`.
+            disp.saved = Object.assign({}, disp.saved, { [k]: entry });
+            stateFile.setText(JSON.stringify(disp.saved, null, 2));
+        }
+
+        // Replay whatever is remembered onto whatever is currently attached.
+        //
+        // Only writes where the live value actually differs, which is what
+        // stops this looping: every niri command triggers a refresh, every
+        // refresh calls back into here, and the second pass finds nothing left
+        // to change. Comparing first rather than setting unconditionally is
+        // the whole termination argument.
+        function restore() {
+            if (!disp.loaded)
+                return;
+            for (const o of disp.list) {
+                const want = disp.saved[disp.keyOf(o)];
+                if (!want)
+                    continue;
+                if (want.mode && want.mode !== disp.curMode(o))
+                    disp.niri(o.name, "mode", want.mode);
+                if (want.scale && Math.abs(want.scale - o.logical.scale) > 0.001)
+                    disp.niri(o.name, "scale", want.scale);
+                if (typeof want.brightness === "number" && disp.bright[o.name] !== want.brightness)
+                    disp.setBrightness(o, want.brightness, false);
+            }
+        }
+
+        // ---- brightness ----
+        //
+        // Two entirely different mechanisms behind one row.
+        //
+        // The internal panel has a backlight device, and brightnessctl already
+        // drives it for the XF86MonBrightness keys (see config.kdl). It works
+        // unprivileged because the user is in `video` and the brightnessctl
+        // package ships the udev rule.
+        //
+        // An external monitor has no backlight device anywhere in sysfs. Its
+        // brightness lives in the monitor, reachable only by DDC/CI over the
+        // I2C channel inside the display cable -- ddcutil, VCP feature 0x10.
+        // That needs hardware.i2c.enable and the i2c group, both added in
+        // configuration.nix, and a monitor that bothers to implement DDC.
+        function isInternal(o) {
+            return o.name.indexOf("eDP") === 0 || o.name.indexOf("LVDS") === 0;
+        }
+
+        function hasBrightness(o) {
+            return disp.isInternal(o) || disp.ddc[o.name] !== undefined;
+        }
+
+        function setBrightness(o, pct, store) {
+            const v = Math.max(0, Math.min(100, Math.round(pct)));
+            if (disp.isInternal(o)) {
+                disp.run(["brightnessctl", "--class=backlight", "-q", "set", v + "%"]);
+            } else {
+                const d = disp.ddc[o.name];
+                if (d === undefined)
+                    return;
+                // --noverify because ddcutil otherwise reads the value back
+                // after writing it, doubling an already slow round trip. The
+                // bar shows what it asked for, not what it confirmed; a
+                // monitor that quietly refuses will look like it worked, which
+                // is the price of a row that responds to a click.
+                disp.run(["ddcutil", "--display", String(d), "--noverify", "setvcp", "10", String(v)]);
+            }
+            disp.bright = Object.assign({}, disp.bright, { [o.name]: v });
+            if (store !== false)
+                disp.remember(o, "brightness", v);
+        }
+
+        // brightnessctl -m prints one CSV line:
+        //   acpi_video0,backlight,90,100%,90
+        // fields: device, class, current, percent, max.
+        Process {
+            id: brightReadProc
+            command: ["brightnessctl", "--class=backlight", "-m"]
+            stdout: StdioCollector {
+                onStreamFinished: {
+                    const f = text.trim().split("\n")[0].split(",");
+                    if (f.length < 4)
+                        return;
+                    const pct = parseInt(f[3]);
+                    if (isNaN(pct))
+                        return;
+                    for (const o of disp.list) {
+                        if (disp.isInternal(o))
+                            disp.bright = Object.assign({}, disp.bright, { [o.name]: pct });
+                    }
+                }
+            }
+        }
+
+        // `ddcutil detect --brief` emits a stanza per display:
+        //
+        //   Display 1
+        //      I2C bus:  /dev/i2c-5
+        //      DRM connector: card1-DP-2
+        //      Monitor: EVN:V40U46C:0000000000000
+        //
+        // The DRM connector line is what makes this reliable: card1-DP-2
+        // strips to DP-2, which is exactly niri's output name, so the two
+        // views of the same monitor are matched on the kernel's identifier
+        // rather than on fuzzy EDID string comparison. Older ddcutil builds
+        // omit that line, and those displays simply get no brightness row.
+        //
+        // Detection is slow -- it probes every I2C bus -- so it runs once at
+        // startup and again only on hotplug, never on opening the panel.
+        Process {
+            id: ddcDetectProc
+            command: ["ddcutil", "detect", "--brief"]
+            stdout: StdioCollector {
+                onStreamFinished: {
+                    const map = {};
+                    let cur = -1;
+                    for (const raw of text.split("\n")) {
+                        const line = raw.trim();
+                        const mDisp = line.match(/^Display\s+(\d+)/);
+                        if (mDisp) {
+                            cur = parseInt(mDisp[1]);
+                            continue;
+                        }
+                        const mConn = line.match(/^DRM connector:\s*(?:card\d+-)?(\S+)/);
+                        if (mConn && cur > 0)
+                            map[mConn[1]] = cur;
+                    }
+                    disp.ddc = map;
+                    // Read back what each external panel is actually set to,
+                    // so the first open of the picker shows the monitor's own
+                    // value rather than a guess.
+                    for (const name of Object.keys(map))
+                        ddcReadProc.readOne(name, map[name]);
+                }
+            }
+        }
+
+        // getvcp --brief prints: VCP 10 C <current> <max>
+        Process {
+            id: ddcReadProc
+            property var pendingNames: []
+            property string activeName: ""
+
+            function readOne(name, display) {
+                ddcReadProc.pendingNames.push({ name: name, display: display });
+                ddcReadProc.next();
+            }
+            function next() {
+                if (ddcReadProc.running || ddcReadProc.pendingNames.length === 0)
+                    return;
+                const j = ddcReadProc.pendingNames.shift();
+                ddcReadProc.activeName = j.name;
+                ddcReadProc.command = ["ddcutil", "--display", String(j.display), "--brief", "getvcp", "10"];
+                ddcReadProc.running = true;
+            }
+            onExited: ddcReadProc.next()
+            stdout: StdioCollector {
+                onStreamFinished: {
+                    const f = text.trim().split(/\s+/);
+                    // VCP 10 C <cur> <max>
+                    if (f.length >= 5 && f[0] === "VCP") {
+                        const cur = parseInt(f[3]);
+                        const max = parseInt(f[4]);
+                        if (!isNaN(cur) && !isNaN(max) && max > 0) {
+                            const pct = Math.round(100 * cur / max);
+                            disp.bright = Object.assign({}, disp.bright, { [ddcReadProc.activeName]: pct });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Quickshell.screens is the hotplug signal. It is the same list the
+        // bar's Variants clones over, so by the time this fires niri has
+        // already settled the new output and `niri msg outputs` will describe
+        // it correctly.
+        Connections {
+            target: Quickshell
+            function onScreensChanged() {
+                disp.refresh();
+                brightReadProc.running = true;
+                ddcDetectProc.running = true;
+            }
+        }
+
+        Component.onCompleted: {
+            // outputsProc is kicked off by the state file load, not from here:
+            // restore() must not run before `saved` is populated.
+            brightReadProc.running = true;
+            ddcDetectProc.running = true;
+        }
+    }
+
     // ---- the bar --------------------------------------------------------
     Variants {
         model: Quickshell.screens
 
         PanelWindow {
+            // Named so a cell nested several levels down can still say which
+            // monitor it is drawn on -- see the display cell's onPressed.
+            id: bar
+
             // Variants injects the model element under this name.
             required property var modelData
             screen: modelData
@@ -665,6 +1130,50 @@ ShellRoot {
                     }
                 }
 
+                // Displays. Same shape as the bluetooth cell above: the glyph
+                // carries the one bit of state worth seeing at a glance --
+                // whether anything is plugged in -- and the panel carries
+                // everything else.
+                //
+                // The cell stays visible with no external monitor attached,
+                // because the internal panel's brightness lives in this picker
+                // too and is worth reaching without a keyboard.
+                IconCell {
+                    readonly property int count: disp.list.length
+
+                    tint: count > 1 || root.openPanel === "display" ? root.accent : root.fg
+                    // nf-md-monitor / nf-md-monitor_multiple. Two monitors are
+                    // drawn as two overlapping screens, which is legible at bar
+                    // size in a way a "2" next to one screen would not be.
+                    glyph: root.icon(count > 1 ? 0xF0382 : 0xF0379)
+                    value: ""
+
+                    MouseArea {
+                        anchors.fill: parent
+                        // onPressed for the same reason as the wifi cell: an
+                        // open wifi picker holds the keyboard, and pressing any
+                        // bar cell cancels the pointer grab before onClicked
+                        // can fire.
+                        onPressed: {
+                            // Set before openPanel, so the picker's "which
+                            // monitor first" and "which monitor to open on"
+                            // bindings are already settled by the time the
+                            // window is made visible. Setting it afterwards
+                            // would show one frame in the old order.
+                            root.activeOutput = bar.modelData.name;
+                            root.openPanel = root.openPanel === "display" ? "" : "display";
+                            // Cheap and worth doing on every open: niri's view
+                            // is authoritative and something outside the shell
+                            // -- a config reload, `niri msg` from a terminal --
+                            // may have changed it since the last refresh. The
+                            // slow probe (ddcutil detect) deliberately does not
+                            // run here.
+                            if (root.openPanel === "display")
+                                disp.refresh();
+                        }
+                    }
+                }
+
                 // Battery: upower. displayDevice is the aggregate the daemon
                 // designates for display; on a laptop that is BAT0.
                 //
@@ -771,6 +1280,50 @@ ShellRoot {
         color: root.dim
         font.family: root.mono
         font.pixelSize: 11
+    }
+
+    // A chip in a segmented row -- scale factors, brightness steps. Used where
+    // the choices are few, short and mutually exclusive, which a column of
+    // full-width PickerRows would waste a lot of panel height saying.
+    //
+    // Deliberately not a drag slider. Brightness on an external monitor goes
+    // out over DDC/CI, where a single write costs 100-300ms; a slider would
+    // queue a write per pixel of travel and spend the next ten seconds
+    // replaying them into a monitor that fell further behind with each one.
+    // Discrete steps are one write per click.
+    component SegCell: Rectangle {
+        id: seg
+        property string label
+        property bool active: false
+        property bool available: true
+        signal activated
+
+        width: segText.implicitWidth + 14
+        height: 22
+        radius: 3
+        color: seg.active ? root.accent : (segMouse.containsMouse && seg.available ? root.hover : "transparent")
+        border.width: 1
+        border.color: seg.active ? root.accent : root.hover
+
+        Text {
+            id: segText
+            anchors.centerIn: parent
+            text: seg.label
+            // On the accent fill the text has to flip to the background colour
+            // -- fg on accent is two light colours on top of each other.
+            color: seg.active ? root.bg : (seg.available ? root.fg : root.dim)
+            font.family: root.mono
+            font.pixelSize: 11
+        }
+
+        MouseArea {
+            id: segMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            // onPressed for the same reason as the bar cells: a picker holding
+            // keyboard focus cancels the pointer grab before onClicked fires.
+            onPressed: if (seg.available) seg.activated()
+        }
     }
 
     // Click-away catcher. A transparent full-screen surface that closes
@@ -1372,6 +1925,229 @@ ShellRoot {
             // app-id so a niri window rule can float it without catching every
             // other kitty.
             command: ["kitty", "--class", "bluetui", "-e", "bluetui"]
+        }
+    }
+
+    // Display picker: resolution, scale and brightness, per monitor.
+    //
+    // Wider than the others at 460, because the brightness row is ten chips
+    // across and wrapping it would break the one thing that makes a segmented
+    // row readable -- that it is a single line you scan left to right.
+    PanelWindow {
+        visible: root.openPanel === "display"
+        // Open on the monitor whose bar was pressed, rather than leaving it to
+        // the compositor. The other pickers are screenless and land wherever
+        // niri puts them, which is fine when their content is the same
+        // everywhere -- one wifi list, one bluetooth list. This one's content is
+        // per monitor and ordered by root.activeOutput, so it opening anywhere
+        // other than the screen it is describing would be actively misleading.
+        //
+        // null is the unset value, i.e. back to compositor choice, and is what
+        // this falls to before the first press and during a hotplug.
+        screen: {
+            const want = root.activeOutput;
+            if (!want)
+                return null;
+            const s = Quickshell.screens.find(x => x.name === want);
+            return s ? s : null;
+        }
+        WlrLayershell.layer: WlrLayer.Overlay
+        exclusionMode: ExclusionMode.Ignore
+        anchors {
+            top: true
+            right: true
+        }
+        margins {
+            top: 34
+            right: 8
+        }
+        implicitWidth: 460
+        implicitHeight: dispCol.implicitHeight + 20
+        color: root.bg
+
+        Column {
+            id: dispCol
+            anchors.fill: parent
+            anchors.margins: 10
+            spacing: 6
+
+            Repeater {
+                model: disp.list
+
+                Column {
+                    id: monCol
+                    required property var modelData
+                    readonly property var o: modelData
+                    readonly property bool internal: disp.isInternal(o)
+                    readonly property int bright: disp.bright[o.name] !== undefined ? disp.bright[o.name] : -1
+
+                    width: dispCol.width
+                    spacing: 4
+
+                    // Make and model, with the connector in brackets. Both
+                    // matter: the name is what you recognise the monitor by,
+                    // the connector is what tells you which of two identical
+                    // ones you are about to change.
+                    PickerHeading {
+                        width: monCol.width
+                        elide: Text.ElideRight
+                        color: root.accent
+                        text: {
+                            const o = monCol.o;
+                            const id = [o.make, o.model].filter(s => s && s.length > 0).join(" ");
+                            return (id.length > 0 ? id : o.name) + "  (" + o.name + ")";
+                        }
+                    }
+
+                    PickerHeading {
+                        text: "Resolution"
+                    }
+
+                    Repeater {
+                        model: disp.modeList(monCol.o)
+
+                        PickerRow {
+                            id: modeRow
+                            required property var modelData
+                            readonly property string str: disp.modeStr(modelData)
+                            readonly property bool isCurrent: str === disp.curMode(monCol.o)
+                            width: monCol.width
+                            onActivated: {
+                                disp.niri(monCol.o.name, "mode", modeRow.str);
+                                disp.remember(monCol.o, "mode", modeRow.str);
+                            }
+
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.left: parent.left
+                                anchors.leftMargin: 6
+                                width: parent.width - 12
+                                elide: Text.ElideRight
+                                color: modeRow.isCurrent ? root.accent : root.fg
+                                font.family: root.mono
+                                font.pixelSize: 12
+                                // Refresh rounded to whole Hz. The fractional
+                                // part is never the thing being chosen here --
+                                // modeList already kept only the fastest timing
+                                // per resolution -- and "59.997 Hz" next to
+                                // "30.000 Hz" reads as precision that is not
+                                // being offered.
+                                text: {
+                                    const m = modeRow.modelData;
+                                    return m.width + "x" + m.height + "   " + Math.round(m.refresh_rate / 1000) + " Hz" + (m.is_preferred ? "   (EDID preferred)" : "");
+                                }
+                            }
+                        }
+                    }
+
+                    // The disclosure row for everything at or below 1080p.
+                    // Shown only when there is something to disclose, so a
+                    // monitor offering nothing but its native mode gets no
+                    // dangling control.
+                    PickerRow {
+                        readonly property int hidden: disp.hiddenCount(monCol.o)
+                        readonly property bool open: disp.expanded[monCol.o.name] === true
+
+                        width: monCol.width
+                        visible: hidden > 0 || open
+                        height: visible ? 26 : 0
+                        onActivated: disp.toggleExpanded(monCol.o.name)
+
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.left: parent.left
+                            anchors.leftMargin: 6
+                            color: root.dim
+                            font.family: root.mono
+                            font.pixelSize: 12
+                            // nf-md-chevron_up / _down: the chevron points the
+                            // way the list is about to move, which is the
+                            // convention every disclosure widget uses.
+                            text: parent.open ? root.icon(0xF0143) + "  Show fewer" : root.icon(0xF0140) + "  Show " + parent.hidden + " more (1080p and below)"
+                        }
+                    }
+
+                    // Scale. Integers are exact for every client; the
+                    // fractional steps are there because 2 on a 4K panel this
+                    // size is often too big, and are the ones wayland only
+                    // approximates -- a client without fractional-scale-v1
+                    // renders at 2x and gets scaled down, so text is softer
+                    // than at either 1 or 2.
+                    PickerHeading {
+                        text: "Scale"
+                    }
+
+                    Row {
+                        spacing: 4
+
+                        Repeater {
+                            model: [1, 1.25, 1.5, 1.75, 2, 2.5, 3]
+
+                            SegCell {
+                                required property var modelData
+                                label: String(modelData)
+                                active: Math.abs(modelData - monCol.o.logical.scale) < 0.001
+                                onActivated: {
+                                    disp.niri(monCol.o.name, "scale", modelData);
+                                    disp.remember(monCol.o, "scale", modelData);
+                                }
+                            }
+                        }
+                    }
+
+                    PickerHeading {
+                        text: {
+                            if (monCol.internal)
+                                return "Brightness";
+                            if (disp.ddc[monCol.o.name] === undefined)
+                                return "Brightness   (no DDC/CI -- use the monitor's own buttons)";
+                            return "Brightness   (DDC/CI)";
+                        }
+                    }
+
+                    Row {
+                        spacing: 4
+                        // Steps of 10 rather than a finer grid: on the internal
+                        // panel the backlight has 90 hardware levels, so a
+                        // finer UI step would not always move it, and on DDC
+                        // every step costs a round trip to the monitor.
+                        //
+                        // Starts at 10, not 0. Zero on an external monitor over
+                        // DDC is a black screen you then have to find the
+                        // monitor's physical buttons to undo -- and on the
+                        // internal panel it is a black screen with no buttons
+                        // at all.
+                        Repeater {
+                            model: [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+
+                            SegCell {
+                                required property var modelData
+                                label: String(modelData)
+                                available: disp.hasBrightness(monCol.o)
+                                // The nearest step below the real value, so a
+                                // panel sitting at 87 lights the 80 chip rather
+                                // than nothing at all.
+                                active: monCol.bright >= 0 && Math.floor(Math.max(10, monCol.bright) / 10) * 10 === modelData
+                                onActivated: disp.setBrightness(monCol.o, modelData)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Footer. Says what the panel is doing behind the user's back,
+            // because "it remembered" is invisible when it works and
+            // inexplicable when it does not.
+            PickerHeading {
+                width: dispCol.width
+                wrapMode: Text.WordWrap
+                text: {
+                    const n = Object.keys(disp.saved).length;
+                    if (n === 0)
+                        return "Nothing saved yet -- pick a resolution, scale or brightness and it will be reapplied when this monitor is next plugged in.";
+                    return "Saved for " + n + " monitor" + (n === 1 ? "" : "s") + "; reapplied on plug-in.";
+                }
+            }
         }
     }
 
