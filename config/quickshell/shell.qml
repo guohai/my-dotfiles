@@ -114,9 +114,15 @@ ShellRoot {
     Scope {
         id: sys
 
-        property real cpuPct: 0
-        property real memPct: 0
-        property string diskPct: "--"
+        // -1 and "" mean "no sample yet", and the bar cells hide themselves
+        // until one arrives. 0 cannot carry that meaning: an idle machine
+        // genuinely reads 0% cpu, and a cell that vanished whenever the box
+        // went quiet would be worse than one that starts late. cpu needs two
+        // /proc/stat samples before it can say anything at all, so this state
+        // is real for the first tick rather than theoretical.
+        property real cpuPct: -1
+        property real memPct: -1
+        property string diskPct: ""
 
         // /proc/stat is cumulative since boot, so one read says nothing.
         // Keep the previous sample and report the delta.
@@ -155,7 +161,11 @@ ShellRoot {
             id: dfProc
             command: ["df", "--output=pcent", "/"]
             stdout: StdioCollector {
-                onStreamFinished: sys.diskPct = text.split("\n")[1].trim()
+                // df prints a header line then the figure. Guard the index:
+                // if df fails or writes nothing, [1] is undefined and .trim()
+                // throws, which would leave the cell showing the last good
+                // reading forever with no sign it had gone stale.
+                onStreamFinished: sys.diskPct = (text.split("\n")[1] ?? "").trim()
             }
         }
 
@@ -1426,19 +1436,27 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                     }
                 }
 
+                // Each of these hides whole rather than showing a glyph with a
+                // placeholder after it. The icon on its own says which reading
+                // is missing, which is not something worth taking bar width to
+                // say -- and a stat cell with no number reads as a broken
+                // probe rather than as one that has not answered yet.
                 IconCell {
                     glyph: root.icon(0xF4BC)
                     value: sys.cpuPct.toFixed(0) + "%"
+                    visible: sys.cpuPct >= 0
                 }
                 IconCell {
                     // nf-md-expansion_card_variant -- reads as a RAM stick.
                     glyph: root.icon(0xF0FB2)
                     value: sys.memPct.toFixed(0) + "%"
+                    visible: sys.memPct >= 0
                 }
                 IconCell {
                     // nf-md-harddisk
                     glyph: root.icon(0xF02CA)
                     value: sys.diskPct
+                    visible: sys.diskPct !== ""
                 }
 
                 // Volume. Scroll to adjust, click to mute, right-click to pick
@@ -1449,6 +1467,11 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                 // confirmation rather than the only signal. Muted is its own
                 // glyph (the crossed-out speaker) rather than the word, which
                 // is the one state worth recognising without reading.
+                //
+                // No sink at all gets a third glyph rather than the muted one,
+                // because the two are not the same thing: muted is a state you
+                // chose and can click to undo, no-sink is the audio stack
+                // having nothing to play to, where clicking does nothing.
                 IconCell {
                     id: volCell
                     readonly property var a: audio.sink?.audio
@@ -1456,12 +1479,21 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
 
                     tint: root.openPanel === "audio" ? root.accent : root.fg
                     glyph: {
+                        // nf-md-volume_mute -- speaker with a cross beside it.
+                        // Checked against the muted glyph at the 18px this
+                        // actually renders at: nf-md-volume_variant_off was the
+                        // other candidate and draws hairline-thin at that size,
+                        // visibly lighter than every other glyph in the row.
+                        if (!a)
+                            return root.icon(0xF075F);
                         // nf-md-volume_off, then _low / _medium / _high.
-                        if (!a || a.muted || vol === 0)
+                        if (a.muted || vol === 0)
                             return root.icon(0xF0581);
                         return root.icon(vol < 34 ? 0xF057F : vol < 67 ? 0xF0580 : 0xF057E);
                     }
-                    value: !a ? "--" : a.muted ? "" : vol + "%"
+                    // No sink shows the glyph alone -- it already says the
+                    // whole story, and there is no percentage to report.
+                    value: !a || a.muted ? "" : vol + "%"
 
                     MouseArea {
                         anchors.fill: parent
@@ -1493,10 +1525,18 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                 // its own, and the SSID is one click away in the picker for the
                 // rare times it actually matters.
                 //
-                // Text survives only for the state the glyph cannot express:
-                // "--" for radio-on-but-associated-with-nothing. Radio off is
-                // the struck-through glyph with no text, since "off" next to a
-                // crossed-out wifi icon says the same thing twice.
+                // No text in any state. The cell used to show "--" for
+                // radio-on-but-associated-with-nothing, which is the one state
+                // the glyph does not express on its own, but a placeholder
+                // sitting in the bar reads as something being broken rather
+                // than as nothing being connected. Radio off is the
+                // struck-through glyph, and "off" next to a crossed-out wifi
+                // icon would say the same thing twice anyway.
+                //
+                // So connected and on-but-unassociated are now told apart by
+                // the tint alone. If that turns out to be too quiet, the fix is
+                // a third glyph for unassociated rather than bringing the text
+                // back.
                 IconCell {
                     // accent means connected, not merely panel-open. The picker
                     // is a large popup on screen when open, so it does not need
@@ -1504,7 +1544,6 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                     tint: net.active || root.openPanel === "wifi" ? root.accent : root.fg
                     // nf-md-wifi / nf-md-wifi_off
                     glyph: root.icon(Networking.wifiEnabled ? 0xF05A9 : 0xF05AA)
-                    value: !Networking.wifiEnabled || net.active ? "" : "--"
 
                     MouseArea {
                         anchors.fill: parent
