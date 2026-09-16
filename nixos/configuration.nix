@@ -715,8 +715,53 @@ in
     # hand-written kitty.conf / foot.ini.
     backupFileExtension = "hm-bak";
 
-    users.lab = { ... }: {
+    users.lab = { config, ... }: {
       home.stateVersion = "26.05";
+
+      # Make `npm install -g` a supported way to install a CLI on this machine.
+      #
+      # npm's global prefix defaults to the nodejs derivation in the Nix store,
+      # which is read-only, so out of the box the command fails outright. These
+      # two lines point it at a writable directory and put the resulting bin/
+      # on PATH. That is the whole mechanism; nothing here is specific to any
+      # particular package, and `npm install -g <anything>` works afterwards
+      # without further config.
+      #
+      # ~/.npm-global rather than the /root/.npm-global an older install used:
+      # /root is mode 0700, which is precisely why that one ended up
+      # unreachable from this account (see the claude-code note in
+      # systemPackages).
+      #
+      # The deliberate trade. Everything under this prefix is imperative and
+      # invisible to a rebuild -- it will not be reinstalled on a fresh machine
+      # and `nixos-rebuild switch` neither knows nor cares what is in there.
+      # `npm ls -g` is the inventory and `npm update -g` the upgrade. That is
+      # the cost of not writing a derivation per tool, and it is accepted on
+      # purpose: for a CLI that exists only on the npm registry, the Nix route
+      # is not "install it declaratively" but "hand-pin a release tarball hash
+      # and re-pin it on every upgrade", which is a lot of ceremony for
+      # something that is one command elsewhere. Reach for systemPackages when
+      # nixpkgs has the tool (it is still the better answer when it applies),
+      # and for this when it does not.
+      #
+      # Note that npm packages shipping a prebuilt binary rather than JS are
+      # very common, and those binaries name /lib64/ld-linux-x86-64.so.2 as
+      # their interpreter and link against plain FHS sonames -- neither of
+      # which a NixOS system provides at those paths. They run here only
+      # because programs.nix-ld.enable above installs a shim at that
+      # interpreter path and serves the sonames from its own library set. So
+      # nix-ld is load-bearing for this whole arrangement, not incidental:
+      # turning it off would not merely inconvenience some unrelated blob, it
+      # would break a good fraction of whatever gets installed this way.
+      #
+      # ~/.npmrc is deliberately left unmanaged so `npm config set ...` keeps
+      # working. Had it been written by home-manager it would be a read-only
+      # store symlink and every such command would fail. The one wrinkle: an
+      # NPM_CONFIG_* environment variable outranks the file, so `npm config
+      # set prefix` specifically will look like it succeeded and have no
+      # effect. Change it here instead.
+      home.sessionVariables.NPM_CONFIG_PREFIX = "${config.home.homeDirectory}/.npm-global";
+      home.sessionPath = [ "${config.home.homeDirectory}/.npm-global/bin" ];
 
       programs.fish = {
         enable = true;
@@ -1235,6 +1280,11 @@ in
     # lived under /root/.npm-global, which is unreachable from the lab user
     # because /root is mode 0700. Self-update is disabled (read-only Nix
     # store); bump the channel and rebuild to upgrade.
+    #
+    # This is not an argument against npm -g in general -- there is a working
+    # user-level prefix for that in home-manager.users.lab, and it is the right
+    # tool for a CLI nixpkgs does not carry. It is an argument for preferring
+    # nixpkgs when nixpkgs has the package, which it does here.
     claude-code
     git
     # ncurses browser for git history. Reads the repo directly, no daemon and
@@ -1247,8 +1297,8 @@ in
     # ~/.config/gh/hosts.yml in plaintext. That path is outside this repo, but
     # it is worth knowing about before backing up ~/.config wholesale.
     gh
-    # Second coding agent alongside claude-code. Same reasoning for putting it
-    # system-wide rather than npm -g: the Nix store is read-only, so its
+    # Second coding agent alongside claude-code, and system-wide for the same
+    # reason: nixpkgs carries it. The Nix store is read-only, so its
     # self-update is inert and upgrading means bumping the channel and
     # rebuilding. Auth state lands in ~/.codex/, outside this repo.
     codex
