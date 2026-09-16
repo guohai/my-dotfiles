@@ -335,16 +335,35 @@ ShellRoot {
             onLoadFailed: info.batFull = -1
         }
 
-        // upower's own update is the clock. sysfs files raise no inotify event
-        // on change, so watchChanges would never fire -- checked on the real
-        // files, not assumed -- and a timer of our own would be a second, worse
-        // guess at a cadence upower already has. When it says the charge moved,
-        // re-read the files it moved in.
+        // A timer of our own, not upower's percentageChanged, which is what this
+        // used to hang off. sysfs raises no inotify event on change -- checked
+        // on the real files -- so something has to ask, and upower turned out to
+        // be the wrong thing to ask.
         //
-        // No loop: reloading these does not touch upower.
-        Connections {
-            target: UPower.displayDevice
-            function onPercentageChanged() {
+        // Measured while discharging: upower republishes every 31 seconds,
+        // where charge_now falls continuously at about 0.9% a minute. Hanging
+        // the reload off upower therefore left this value up to half a point
+        // stale, while the lock screen re-reads sysfs on every frame it draws.
+        // Two readings of the same file half a point apart land on different
+        // integers whenever a rounding boundary falls in the gap, which is
+        // often enough to see -- and seeing it is the entire failure this was
+        // supposed to fix. The numbers agreed on average and disagreed exactly
+        // when someone looked.
+        //
+        // 5s puts the staleness under a tenth of a point at that discharge
+        // rate. Polling is affordable here in a way it is not for liveProc
+        // below: two small sysfs reads and no process, against a shell fork.
+        //
+        // This does not make a mismatch impossible and is not meant to. Two
+        // clocks sampling a continuously falling number will disagree by one at
+        // a boundary sooner or later; the point is that it should be rare and
+        // brief rather than routine.
+        Timer {
+            interval: 5000
+            running: true
+            repeat: true
+            triggeredOnStart: true
+            onTriggered: {
                 batNowFile.reload();
                 batFullFile.reload();
             }
