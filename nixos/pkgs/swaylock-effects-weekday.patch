@@ -152,9 +152,9 @@
 +		// (uWh) -- try both, then fall back to `capacity` for anything
 +		// exotic that publishes neither.
 +		//
-+		// This can still land a point off the bar: upower derives energy
-+		// from voltage_now while the charge_* pair is voltage-free. Both
-+		// round to the same integer in normal use.
++		// upower's own percentage runs two to three points under this
++		// on a discharging cell, because it scales by voltage_now. The
++		// bar reads these two files rather than upower, so it agrees.
 +		if ((read_ps_long(base, ent->d_name, "charge_now", &now) &&
 +				read_ps_long(base, ent->d_name, "charge_full", &full) &&
 +				full > 0) ||
@@ -220,8 +220,8 @@
 +	// Material Design battery glyphs indexed by tenths: U+F008E is the empty
 +	// outline, U+F007A..U+F0082 are 10%..90%, U+F0079 is a full cell and
 +	// U+F0084 is the charging bolt. The Quickshell bar draws the same table
-+	// from upower (see the battery Cell in config/quickshell/shell.qml) --
-+	// the two sit side by side at every lock, so they move together.
++	// over the same two sysfs files (root.batGlyph and info.batPct in
++	// config/quickshell/shell.qml), so the two move together at every lock.
 +	static const char *levels[] = {
 +		"\xf3\xb0\x82\x8e", "\xf3\xb0\x81\xba", "\xf3\xb0\x81\xbb",
 +		"\xf3\xb0\x81\xbc", "\xf3\xb0\x81\xbd", "\xf3\xb0\x81\xbe",

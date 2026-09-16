@@ -73,6 +73,31 @@ ShellRoot {
         return String.fromCodePoint(cp);
     }
 
+    // The battery glyph, from the same table the lock screen draws: U+F008E is
+    // the empty outline, F007A..F0082 are 10%..90%, F0079 is a full cell and
+    // F0084 the charging bolt. nf-md-battery is F0079 and nf-md-battery_10
+    // ..._90 run F007A..F0082, which is why the tenths bucket maps to F0079+n
+    // for everything in between.
+    //
+    // One function rather than the expression repeated at each call site,
+    // because the bar cell and the lock screen sit side by side every time the
+    // machine locks and any disagreement between them reads as a bug in one of
+    // them. The lock screen's half of this is levels[] in battext(),
+    // nixos/pkgs/swaylock-effects-weekday.patch -- C, so it cannot literally
+    // share this code. Keeping the two in step means keeping the table and the
+    // percentage that indexes it identical; see info.batPct for the second
+    // half, which is the one that was actually out.
+    function batGlyph(pct, charging) {
+        if (charging)
+            return icon(0xF0084);
+        const tenths = Math.floor(Math.max(0, Math.min(100, pct)) / 10);
+        if (tenths === 0)
+            return icon(0xF008E);
+        if (tenths >= 10)
+            return icon(0xF0079);
+        return icon(0xF0079 + tenths);
+    }
+
     // Which popup is open, or "" for none. One string rather than a bool per
     // popup so opening one always closes the others.
     property string openPanel: ""
@@ -220,14 +245,15 @@ ShellRoot {
         property var stat: ({})
         property var live: ({})
 
-        // Battery comes from upower, not from sysfs, so this page and the bar
-        // cell cannot disagree -- see the long note on the battery cell.
+        // upower supplies the battery's state and its time estimates. It does
+        // not supply the percentage any more -- see batPct below.
         //
-        // The kernel's own `capacity` attribute is the trap. On this battery it
-        // is charge_now/charge_full_design, so it reports how full the cell is
-        // as a fraction of what it held when new, and can never reach 100:
-        // 2316000/4790000 = 48% where upower says 60. Everything else that
-        // shows a battery percentage here divides by charge_full instead.
+        // The kernel's own `capacity` attribute is the trap, and neither source
+        // uses it. On this battery it is charge_now/charge_full_design, so it
+        // reports how full the cell is as a fraction of what it held when new,
+        // and can never reach 100: it reads 53 where the other two say 66 and
+        // 68. Everything that shows a battery percentage divides by
+        // charge_full instead.
         //
         // Cycle count still comes from sysfs. upower does not expose it.
         readonly property var bat: UPower.displayDevice
@@ -236,9 +262,7 @@ ShellRoot {
         // Health has to come off the real BAT0 entry rather than displayDevice.
         // displayDevice is a synthetic aggregate: it carries state, percentage
         // and energy-full, but not energy-full-design, so healthSupported is
-        // false on it and healthPercentage reads 0. The percentage above still
-        // comes from displayDevice, because that is what the bar cell uses and
-        // the two have to agree.
+        // false on it and healthPercentage reads 0.
         //
         // healthPercentage is on a 0-100 scale -- 80.02 here -- while
         // percentage on the same object is 0-1. That asymmetry is upstream's,
@@ -249,6 +273,81 @@ ShellRoot {
                 if (d.isLaptopBattery)
                     return d;
             return null;
+        }
+
+        // The percentage, read off sysfs with the lock screen's arithmetic
+        // instead of taken from upower, because the two do not agree and the
+        // lock screen is the one that cannot be changed from here.
+        //
+        // Measured on this machine, discharging: charge_now/charge_full is
+        // 2516000/3704000 = 68%, upower says 65.5%. Both are defensible and
+        // neither is the kernel's broken `capacity`. The gap is voltage:
+        // sysfs publishes charge_* in uAh only, so upower multiplies by
+        // voltage_now to get energy while dividing by an energy_full taken at
+        // a higher resting voltage. A sagging cell therefore reads low there
+        // and does not here. The gap widens as the battery drains, which is
+        // exactly when the number is looked at.
+        //
+        // Two points is enough to cross a tenths boundary, and when it does
+        // the glyphs disagree too -- the bar showing one bar more or less than
+        // the screen it was unlocked from seconds earlier. That is the whole
+        // reason this moved.
+        //
+        // The cost, stated plainly: the bar no longer matches `upower -i`, or
+        // anything else reading upower. It matches the lock screen instead.
+        // That is the trade that was asked for, and only one of the two can be
+        // matched at a time.
+        property int batNow: -1
+        property int batFull: -1
+
+        readonly property int batPct: {
+            if (!batPresent)
+                return -1;
+            // upower is the fallback, not the source: if the sysfs pair is
+            // missing the bar shows a slightly different number rather than
+            // nothing. The lock screen falls back the same way, to `capacity`.
+            if (batNow >= 0 && batFull > 0)
+                return Math.max(0, Math.min(100, Math.round(batNow * 100 / batFull)));
+            return Math.max(0, Math.min(100, Math.round(bat.percentage * 100)));
+        }
+
+        // FileView rather than another poll: reading two sysfs files costs no
+        // process, where the liveProc below forks a shell. That matters here
+        // and not there, because the bar is always on screen and liveProc only
+        // runs while the system page is open.
+        //
+        // Paths come from statProc because they have to be discovered -- BAT0
+        // against BAT1, charge_* against energy_* -- and discovery is a
+        // one-shot job that a FileView cannot do for itself.
+        FileView {
+            id: batNowFile
+            path: info.stat.batNowPath || ""
+            printErrors: false
+            onLoaded: info.batNow = Number(text())
+            onLoadFailed: info.batNow = -1
+        }
+
+        FileView {
+            id: batFullFile
+            path: info.stat.batFullPath || ""
+            printErrors: false
+            onLoaded: info.batFull = Number(text())
+            onLoadFailed: info.batFull = -1
+        }
+
+        // upower's own update is the clock. sysfs files raise no inotify event
+        // on change, so watchChanges would never fire -- checked on the real
+        // files, not assumed -- and a timer of our own would be a second, worse
+        // guess at a cadence upower already has. When it says the charge moved,
+        // re-read the files it moved in.
+        //
+        // No loop: reloading these does not touch upower.
+        Connections {
+            target: UPower.displayDevice
+            function onPercentageChanged() {
+                batNowFile.reload();
+                batFullFile.reload();
+            }
         }
 
         // key=value, one per line. Split on the first = only -- the DMI strings
@@ -330,7 +429,7 @@ ShellRoot {
             add("Memory", s.memTotal ? info.gib(s.memTotal) + (Number(s.swapTotal) > 0 ? "   " + info.gib(s.swapTotal) + " swap" : "   no swap") : "");
             add("Storage", s.diskModel);
             add("Volume", s.rootFs && v.diskSize ? s.rootFs + "   " + info.gibN(v.diskUsed) + " of " + info.gib(v.diskSize) + " used (" + v.diskPct + ")" : s.rootFs);
-            add("Battery", info.batPresent ? Math.round(info.bat.percentage * 100) + "%   " + root.cap(UPowerDeviceState.toString(info.bat.state)) + (v.acOnline === "1" ? "   AC connected" : "") : "");
+            add("Battery", info.batPresent ? info.batPct + "%   " + root.cap(UPowerDeviceState.toString(info.bat.state)) + (v.acOnline === "1" ? "   AC connected" : "") : "");
             // Health and cycles are the thing this page exists to surface that
             // nothing else on the bar does. Either half can be missing without
             // taking the other with it.
@@ -400,6 +499,23 @@ for n in /sys/class/nvme/nvme*/model /sys/block/sd*/device/model; do
   if [ -r "$n" ]; then echo "diskModel=$(sed 's/ *$//' $n)"; break; fi
 done
 echo "rootFs=$(findmnt -no SOURCE,FSTYPE / 2>/dev/null | awk '{print $1"   "$2}')"
+# Paths only, not values -- FileView reads these, so nothing here has to run
+# again when the charge changes. Preference order mirrors battery_status() in
+# nixos/pkgs/swaylock-effects-weekday.patch: first entry whose type is Battery,
+# charge_* before energy_*. Written as a list of _now names with _full derived
+# by sed because a \${p}_now would close this template literal.
+for b in /sys/class/power_supply/*; do
+  [ "$(cat $b/type 2>/dev/null)" = Battery ] || continue
+  for n in charge_now energy_now; do
+    f=$(echo $n | sed s/_now/_full/)
+    if [ -r "$b/$n" ] && [ -r "$b/$f" ]; then
+      echo "batNowPath=$b/$n"
+      echo "batFullPath=$b/$f"
+      break
+    fi
+  done
+  break
+done
 echo "host=$(cat /proc/sys/kernel/hostname)"
 echo "kernel=$(cat /proc/sys/kernel/osrelease)"
 echo "os=$(. /etc/os-release; echo $PRETTY_NAME)"
@@ -1821,60 +1937,35 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                     }
                 }
 
-                // Battery: upower. displayDevice is the aggregate the daemon
-                // designates for display; on a laptop that is BAT0.
+                // Battery. Every fact here comes from the info scope rather
+                // than from a second read of upower, so this cell and the
+                // system page cannot report different charges -- they used to
+                // hold separate copies of the same expression, which is the
+                // kind of duplication that only stays correct by luck.
                 //
                 // Glyph and wording are deliberately identical to the lock
-                // screen's --batstr, which draws the same Material Design cells
-                // straight from /sys/class/power_supply -- see the battext()
-                // and battery_status() hunks in
-                // nixos/pkgs/swaylock-effects-weekday.patch. The two are read
-                // within seconds of each other every time the machine locks, so
-                // any disagreement between them reads as a bug in one of them.
-                // Change one, change the other.
+                // screen's --batstr -- see the battext() and battery_status()
+                // hunks in nixos/pkgs/swaylock-effects-weekday.patch. The two
+                // are read within seconds of each other every time the machine
+                // locks, so any disagreement between them reads as a bug in one
+                // of them. Change one, change the other.
                 //
-                // The numbers agree because both divide by what the cell holds
-                // *today* rather than by its design capacity: upower does that
-                // in the daemon, the patch computes charge_now/charge_full by
-                // hand for the same reason. On this machine -- 68% health after
-                // 518 cycles -- trusting the kernel's own `capacity` attribute
-                // instead would have put the lock screen 26 points under the
-                // bar.
+                // Both halves of that agreement are now pinned: the table is
+                // root.batGlyph and the percentage indexing it is info.batPct,
+                // which reads the patch's own two sysfs files. Taking upower's
+                // percentage instead left the bar two points under the lock
+                // screen, which is enough to show a different number of bars.
                 IconCell {
-                    readonly property var bat: UPower.displayDevice
-                    readonly property bool present: bat && bat.isLaptopBattery
+                    readonly property bool present: info.batPresent
                     // "Full" counts as charging, matching the patch, which
                     // treats a status of Charging or Full the same way. On the
                     // bolt there is no level to draw anyway.
                     readonly property bool charging: present
-                        && (bat.state === UPowerDeviceState.Charging
-                            || bat.state === UPowerDeviceState.FullyCharged)
-                    readonly property int pct: present
-                        ? Math.max(0, Math.min(100, Math.round(bat.percentage * 100)))
-                        : 0
+                        && (info.bat.state === UPowerDeviceState.Charging
+                            || info.bat.state === UPowerDeviceState.FullyCharged)
+                    readonly property int pct: present ? info.batPct : 0
 
-                    // nf-md-battery is U+F0079 (full) and nf-md-battery_10
-                    // ..._90 run F007A..F0082, which is why the tenths bucket
-                    // maps to F0079+n for everything in between.
-                    // nf-md-battery_charging is F0084 and
-                    // nf-md-battery_outline F008E.
-                    //
-                    // The empty outline for the last 10% is the one place this
-                    // and the lock screen were allowed to drift from the
-                    // original table, and the patch was changed to match rather
-                    // than left alone.
-                    glyph: {
-                        if (!present)
-                            return "";
-                        if (charging)
-                            return root.icon(0xF0084);
-                        const tenths = Math.floor(pct / 10);
-                        if (tenths === 0)
-                            return root.icon(0xF008E);
-                        if (tenths >= 10)
-                            return root.icon(0xF0079);
-                        return root.icon(0xF0079 + tenths);
-                    }
+                    glyph: present ? root.batGlyph(pct, charging) : ""
 
                     // Colour is bar-only: swaylock draws the whole battery line
                     // in --text-color and has no per-line colour option, so the
