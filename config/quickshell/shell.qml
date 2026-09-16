@@ -34,8 +34,25 @@ ShellRoot {
     // distinguished from an emergency at a glance -- see the battery cell,
     // which is the only thing using it.
     readonly property color warn: "#fab387"
+    // Catppuccin Mocha yellow, for a state the machine is being held in on
+    // purpose rather than a level it has fallen to. Currently the stay-awake
+    // mode on the battery cell.
+    //
+    // A separate colour rather than reusing warn, even though both mean "look
+    // at this": they appear on the same cell, and one peach that means either
+    // "the battery is low" or "suspend is inhibited" is a colour you cannot
+    // act on without opening the panel to find out which. Yellow reads as a
+    // caution next to fg while staying clearly apart from peach.
+    readonly property color caution: "#f9e2af"
     readonly property color hover: "#313244"
     readonly property string mono: "JetBrainsMono Nerd Font"
+
+    // The one left inset every panel's content starts at, so headings, rows,
+    // chips and prose all share a margin rather than each picking their own.
+    // PickerRow is what sets the value: its hover fill spans the full panel
+    // width, and text flush against that edge looks cramped -- everything else
+    // matches it so the column reads as a column.
+    readonly property int inset: 6
 
     // Nerd Font Material Design glyphs, by codepoint.
     //
@@ -323,6 +340,13 @@ ShellRoot {
             if (v.batCycles)
                 cond.push(v.batCycles + " cycles");
             add("Condition", cond.join("   "));
+            // "off" rather than "0 rpm": on this chassis the fan genuinely
+            // stops when the machine is cool, and 0 rpm reads like a failed
+            // sensor. Raw rpm rather than a percentage of the 1200-7200 range,
+            // because the floor is 1200 -- a bar that jumped from empty to a
+            // fifth full the moment the fan moved at all would be worse than
+            // the number. Whole row drops out if there is no fan sensor.
+            add("Cooling", v.fanRpm !== undefined ? (v.fanLabel ? v.fanLabel + "   " : "") + (Number(v.fanRpm) > 0 ? v.fanRpm + " rpm" : "off") : "");
             add("Firmware", s.firmware ? s.firmware + (s.firmwareDate ? "   " + info.isoDate(s.firmwareDate) : "") : "");
             return r;
         }
@@ -404,6 +428,17 @@ fi
 for a in /sys/class/power_supply/A*/online; do
   if [ -r "$a" ]; then echo "acOnline=$(cat $a)"; break; fi
 done
+# hwmon first because that is where fans live on ordinary hardware; applesmc
+# second because on this machine they are not there. Its hwmon node exists but
+# carries no fan attributes, so the sensor has to be read off the platform
+# device directly -- checked, not assumed. First fan wins; this chassis has one.
+# The label is padded with trailing spaces in sysfs.
+for f in /sys/class/hwmon/hwmon*/fan?_input /sys/devices/platform/applesmc.*/fan?_input; do
+  [ -r "$f" ] || continue
+  echo "fanRpm=$(cat $f)"
+  echo "fanLabel=$(cat "$(echo $f | sed s/_input/_label/)" 2>/dev/null | sed "s/ *$//")"
+  break
+done
 df -P / 2>/dev/null | awk 'NR==2{print "diskSize="$2; print "diskUsed="$3; print "diskPct="$5}'
 `]
             stdout: StdioCollector {
@@ -454,27 +489,132 @@ df -P / 2>/dev/null | awk 'NR==2{print "diskSize="$2; print "diskUsed="$3; print
         }
     }
 
+    // ---- power ----------------------------------------------------------
+    // "Stay awake": a logind inhibitor lock held for exactly as long as this
+    // process runs. The toggle is `awake.running` and nothing else -- there is
+    // no separate bool to fall out of sync with the lock it is supposed to
+    // describe.
+    //
+    // Three things suspend this machine and this blocks two of them, both of
+    // which go through logind so one lock covers both:
+    //
+    //   idle 900s -> `systemctl suspend`   (services.swayidle, configuration.nix)
+    //   lid close                          (logind HandleLidSwitch = "suspend")
+    //
+    // handle-power-key is deliberately absent. Pressing the power key is an
+    // explicit request to sleep and swallowing it would be surprising in a way
+    // the idle timer and the lid are not -- and it is not logind's to give
+    // anyway: niri already holds its own block lock on it, which is visible in
+    // `systemd-inhibit --list`.
+    //
+    // What this does NOT block is the screen going dark, which is the entire
+    // point. The 300s lock and the 330s `niri msg action power-off-monitors`
+    // are compositor-side rather than logind operations, so no inhibitor
+    // reaches them. The machine stays up on the network with the panel black.
+    //
+    // Releasing the lock *is* the process exiting, so the lock itself never
+    // outlives the shell. The *choice* does, via the state file below. The one
+    // case neither covers is quickshell being SIGKILLed, which can orphan the
+    // child -- it shows up in `systemd-inhibit --list` under the who string
+    // below, and `pkill -f 'systemd-inhibit.*Quickshell'` clears it. Worth
+    // writing down, because "the laptop stopped sleeping" otherwise has no
+    // visible cause.
+    Process {
+        id: awake
+        command: ["systemd-inhibit", "--what=sleep:handle-lid-switch", "--who=Quickshell bar", "--why=Stay awake toggle", "--mode=block", "--", "sleep", "infinity"]
+        // Write on every transition, including one the shell did not ask for.
+        // If the command fails to start, running falls back to false and this
+        // records false -- the file tracks what is actually happening rather
+        // than what was last clicked, which is the only way the restored state
+        // can be trusted.
+        onRunningChanged: awakeState.setText(running ? "1\n" : "0\n")
+    }
+
+    // Remembers the choice across shell restarts. Same shape as the monitor
+    // state file: atomic writes, absent-on-first-run is not an error, and
+    // watchChanges so hand-editing the file works (echo 0 > it, and the mode
+    // turns off).
+    //
+    // Persisting the choice costs a fail-safe, deliberately: a toggle that
+    // could not outlive a restart also could not silently pin the laptop
+    // awake. This one can, and a machine left on battery with the lid shut
+    // will run until it dies. The bar's yellow is the only warning.
+    //
+    // It does NOT survive a reboot in the way that matters for remote access.
+    // Restoring happens when this file loads, and this file only loads once
+    // quickshell starts, which is once a graphical session exists -- and login
+    // is greetd/tuigreet with no autologin and no lingering user manager. So
+    // between boot and someone typing a password, nothing holds the lock and
+    // logind's HandleLidSwitch=suspend applies as normal. Reachable with the
+    // lid open, gone when it is shut. Making that case work needs the
+    // inhibitor to live outside the session entirely (a lingering user unit),
+    // which is a configuration.nix change, not a shell one.
+    FileView {
+        id: awakeState
+        path: Quickshell.env("HOME") + "/.local/state/quickshell/stay-awake"
+        atomicWrites: true
+        printErrors: false
+        watchChanges: true
+        // watchChanges only raises fileChanged -- it does not reload by itself,
+        // which was checked against the running shell rather than assumed. Note
+        // the monitors.json FileView above sets watchChanges without this and
+        // so is not actually live either; left alone, since nothing depends on
+        // it reloading.
+        //
+        // No loop: the reload calls onLoaded, which sets running to the value
+        // it already has, which emits no change, so no write follows.
+        onFileChanged: reload()
+        onLoaded: awake.running = text().trim() === "1"
+        onLoadFailed: awake.running = false
+    }
+
     // ---- audio ----------------------------------------------------------
     // PwObjectTracker is mandatory, not decorative: Quickshell only binds a
     // node's properties while something tracks it. Without this the volume
     // reads zero and never updates.
     PwObjectTracker {
-        objects: [Pipewire.defaultAudioSink]
+        objects: [Pipewire.defaultAudioSink, Pipewire.defaultAudioSource]
     }
 
     Scope {
         id: audio
         readonly property var sink: Pipewire.defaultAudioSink
+        readonly property var source: Pipewire.defaultAudioSource
         // Real output devices only: isStream filters out per-application
         // playback nodes, which are also sinks in pipewire's model. A
         // bluetooth headset appears here once wireplumber has routed it.
         readonly property var sinks: Pipewire.nodes.values.filter(n => n.isSink && !n.isStream)
+
+        // Inputs need a third test that outputs do not. isSink is true only
+        // for real outputs, so !isStream is enough there; !isSink is true for
+        // everything that is not an output, which on this machine means the
+        // Dummy and Freewheel drivers, the MIDI bridge, a BLE MIDI port and
+        // the FaceTime camera -- a video node listed under a heading that says
+        // Input. .audio is null for all of them and non-null for the two real
+        // capture devices, so it is the discriminator. PwNodeType would say it
+        // more directly but does not survive into QML as a usable enum, which
+        // would leave a bare `n.type === 9` here.
+        readonly property var sources: Pipewire.nodes.values.filter(n => !n.isSink && !n.isStream && n.audio)
 
         function bump(delta) {
             if (!sink?.audio)
                 return;
             sink.audio.muted = false;
             sink.audio.volume = Math.max(0, Math.min(1, sink.audio.volume + delta));
+        }
+
+        // Absolute set, for the panel slider. Unmutes for the same reason bump
+        // does: dragging the level is asking to hear something, and a drag that
+        // moved the fill while the machine stayed silent would look broken.
+        //
+        // Clamped to 1.0 even though pipewire will happily go past it. The
+        // slider has a right-hand end, so anything above it would be a level
+        // the bar cannot draw and the drag cannot come back to.
+        function setLevel(v) {
+            if (!sink?.audio)
+                return;
+            sink.audio.muted = false;
+            sink.audio.volume = Math.max(0, Math.min(1, v));
         }
     }
 
@@ -1462,11 +1602,17 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                 // Volume. Scroll to adjust, click to mute, right-click to pick
                 // an output device -- roughly the macOS menu-bar behaviour.
                 //
-                // The speaker fills up with the level the way macOS's does, so
-                // the glyph carries the volume too and the number is
-                // confirmation rather than the only signal. Muted is its own
-                // glyph (the crossed-out speaker) rather than the word, which
-                // is the one state worth recognising without reading.
+                // Glyph only, no percentage: the speaker gains an arc as the
+                // level rises, which costs no bar width, where a figure beside
+                // it costs three characters and reflows the row as it crosses
+                // 100. Muted is its own glyph (the crossed-out speaker) rather
+                // than the word, which is the one state worth recognising
+                // without reading.
+                //
+                // The trade is resolution -- four steps rather than a hundred,
+                // so the cell says roughly-how-loud rather than exactly. The
+                // exact figure is only worth having while dragging, and the
+                // panel slider carries it there.
                 //
                 // No sink at all gets a third glyph rather than the muted one,
                 // because the two are not the same thing: muted is a state you
@@ -1491,10 +1637,6 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                             return root.icon(0xF0581);
                         return root.icon(vol < 34 ? 0xF057F : vol < 67 ? 0xF0580 : 0xF057E);
                     }
-                    // No sink shows the glyph alone -- it already says the
-                    // whole story, and there is no percentage to report.
-                    value: !a || a.muted ? "" : vol + "%"
-
                     MouseArea {
                         anchors.fill: parent
                         acceptedButtons: Qt.LeftButton | Qt.RightButton
@@ -1739,12 +1881,50 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                     // lock screen shows the same glyph in the same grey. The
                     // thresholds still line up with the icon, so an empty cell
                     // is always red and a one-bar cell is always peach.
+                    //
+                    // Goes caution yellow while the machine is being held awake.
+                    // Staying awake is a thing being done to the battery, so
+                    // this is not a category error -- and it is the cell the
+                    // eye already goes to.
+                    //
+                    // Precedence, in a single colour channel carrying two
+                    // different kinds of fact:
+                    //
+                    //   <10% discharging  red     emergency, wins outright
+                    //   held awake        yellow
+                    //   <20% discharging  peach
+                    //   otherwise         fg
+                    //
+                    // Yellow beats the sub-20% peach because the glyph shape
+                    // and the "17%" beside it already say the charge is low --
+                    // colour is the redundant channel there, and the only
+                    // channel the mode has at all.
+                    //
+                    // Under 10% it loses, and that is a real blind spot rather
+                    // than a clean win: held awake at 8% the cell reads red and
+                    // says nothing about the mode, which is the charge level
+                    // where being pinned awake matters most. It is accepted
+                    // because at that point the action is the same either way
+                    // -- plug in -- and red is the colour that says so
+                    // loudest. The panel still reports the mode. A second cell
+                    // would show both at once and was tried; it was not wanted
+                    // on the bar, so this is the deliberate trade.
+                    //
+                    // charging suppresses red and peach as it always has -- a
+                    // battery at 6% with the charger in is recovering, not
+                    // dying -- but not the yellow, which is true regardless of
+                    // what the charger is doing.
+                    //
+                    // This is still the one cell that does not go accent while
+                    // its own panel is open, which every other cell does.
+                    // Lighting it on open would be a third meaning for a colour
+                    // already carrying two.
                     tint: {
-                        if (!present || charging)
-                            return root.fg;
-                        if (pct < 10)
+                        if (present && !charging && pct < 10)
                             return root.bad;
-                        if (pct < 20)
+                        if (awake.running)
+                            return root.caution;
+                        if (present && !charging && pct < 20)
                             return root.warn;
                         return root.fg;
                     }
@@ -1752,6 +1932,15 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                     // "󰂁 63%" -- the lock screen's format string is
                     // "{icon} {p}%", which expands to exactly this.
                     value: present ? pct + "%" : ""
+
+                    MouseArea {
+                        anchors.fill: parent
+                        // onPressed for the same reason as the wifi cell: an
+                        // open wifi picker holds the keyboard, and pressing any
+                        // bar cell cancels the pointer grab before onClicked
+                        // can fire.
+                        onPressed: root.openPanel = root.openPanel === "battery" ? "" : "battery"
+                    }
                 }
             }
         }
@@ -1785,6 +1974,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
         color: root.dim
         font.family: root.mono
         font.pixelSize: 11
+        leftPadding: root.inset
     }
 
     // A label and its value on one line, for pages that are read rather than
@@ -1802,6 +1992,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
         property int labelWidth: 92
 
         height: 18
+        leftPadding: root.inset
 
         Text {
             width: infoRow.labelWidth
@@ -1811,8 +2002,12 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
             font.pixelSize: 12
         }
 
+        // Minus the padding as well as the label column: Row starts its
+        // children at leftPadding but does not shrink the width it was given,
+        // so without this the value would elide against a right edge one inset
+        // past the panel.
         Text {
-            width: infoRow.width - infoRow.labelWidth
+            width: infoRow.width - infoRow.labelWidth - infoRow.leftPadding
             text: infoRow.value
             elide: Text.ElideRight
             color: root.fg
@@ -1835,14 +2030,18 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
         property string label
         property bool active: false
         property bool available: true
+        // Overridable so a chip that selects something the machine should not
+        // be left in can say so in its own colour. Defaults to accent, which is
+        // what every ordinary "this one is selected" chip wants.
+        property color activeColor: root.accent
         signal activated
 
         width: segText.implicitWidth + 14
         height: 22
         radius: 3
-        color: seg.active ? root.accent : (segMouse.containsMouse && seg.available ? root.hover : "transparent")
+        color: seg.active ? seg.activeColor : (segMouse.containsMouse && seg.available ? root.hover : "transparent")
         border.width: 1
-        border.color: seg.active ? root.accent : root.hover
+        border.color: seg.active ? seg.activeColor : root.hover
 
         Text {
             id: segText
@@ -1923,7 +2122,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
         }
     }
 
-    // Audio output picker.
+    // Audio: volume, then the output and input device pickers.
     PanelWindow {
         visible: root.openPanel === "audio"
         WlrLayershell.layer: WlrLayer.Overlay
@@ -1945,6 +2144,175 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
             anchors.fill: parent
             anchors.margins: 10
             spacing: 6
+
+            // Volume, above the device list because it is what this panel gets
+            // opened for most of the time -- switching output device is the
+            // rarer errand, and a control you reach for daily should not sit
+            // under a list whose length depends on what is plugged in.
+            //
+            // Same vocabulary as the bar cell: the same four speaker glyphs,
+            // gaining an arc as the level rises, the crossed-out one for muted.
+            //
+            // The percentage lives here rather than on the bar, which is the
+            // whole split -- the bar is glanced at and pays for every character
+            // in width, the panel is looked at deliberately and has room. This
+            // is also the only place the exact figure is worth having, because
+            // it is the only place you can drag to a particular one.
+            //
+            // With no sink the speaker goes red rather than dim. Dim is the
+            // colour this file uses for "not applicable right now"; nothing to
+            // play to is a fault, and the one state here worth recognising
+            // without reading the device list underneath.
+            PickerHeading {
+                text: "Volume"
+            }
+
+            Item {
+                id: volSlider
+                readonly property var a: audio.sink?.audio
+                // Muted keeps its position and dims rather than collapsing to
+                // zero, so the row still says what unmuting will return to.
+                // The dim carries "not audible right now", and the slashed
+                // glyph says it outright -- collapsing as well would cost the
+                // position and force the figure to read 0% beside a speaker
+                // you can click back to 40.
+                readonly property real level: a ? Math.max(0, Math.min(1, a.volume)) : 0
+
+                // Where the comfort notch sits. See the note on the notch
+                // itself before moving it: this is a perceptual scale, so the
+                // number means something, but not the thing the same number
+                // means in hearing-safety guidance.
+                readonly property real comfort: 0.8
+
+                width: audioCol.width
+                height: 26
+
+                Text {
+                    id: volIcon
+                    anchors.left: parent.left
+                    anchors.leftMargin: root.inset
+                    anchors.verticalCenter: parent.verticalCenter
+                    // Fixed width, centred, because these five glyphs are not
+                    // all the same width -- the slashed and crossed speakers
+                    // are wider than the plain one. The track anchors to this
+                    // Text's right edge, so sizing it to its content would jump
+                    // the track's left end sideways every time the level
+                    // crossed a glyph threshold: during a drag, the control
+                    // wobbling under the cursor.
+                    width: 22
+                    horizontalAlignment: Text.AlignHCenter
+                    font.family: root.mono
+                    font.pixelSize: 18
+                    color: !volSlider.a ? root.bad : volSlider.a.muted ? root.dim : root.fg
+                    text: {
+                        const a = volSlider.a;
+                        // Codepoints already verified against this font at this
+                        // size for the bar cell -- see the note there before
+                        // swapping any of them.
+                        if (!a)
+                            return root.icon(0xF075F);
+                        if (a.muted || volSlider.level === 0)
+                            return root.icon(0xF0581);
+                        const v = volSlider.level * 100;
+                        return root.icon(v < 34 ? 0xF057F : v < 67 ? 0xF0580 : 0xF057E);
+                    }
+
+                    // Click the speaker to mute, matching the bar cell's left
+                    // click. The track does not mute -- a stray click there
+                    // should set a level, not silence the machine.
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: !!volSlider.a
+                        onPressed: volSlider.a.muted = !volSlider.a.muted
+                    }
+                }
+
+                // The track is 4px but the grab area is the full row height.
+                // A 4px drag target is a control you have to aim at.
+                Rectangle {
+                    id: volTrack
+                    anchors.left: volIcon.right
+                    anchors.leftMargin: 10
+                    anchors.right: volPct.left
+                    anchors.rightMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    height: 4
+                    radius: 2
+                    color: root.hover
+
+                    // Accent or, muted, dim -- never bad. With no sink the level
+                    // is 0 and this has no width to colour, so a red branch
+                    // here would be a line that reads as handling the fault
+                    // while doing nothing. The red speaker carries that state.
+                    Rectangle {
+                        width: volTrack.width * volSlider.level
+                        height: parent.height
+                        radius: parent.radius
+                        color: volSlider.a && volSlider.a.muted ? root.dim : root.accent
+                    }
+
+                    // Comfort notch. Drawn in the panel background so it reads
+                    // as a gap cut out of the bar, which works the same whether
+                    // the fill has reached it or not -- and stays quiet, which
+                    // is what a reference mark should be. Above the fill in
+                    // document order so it is not painted over.
+                    //
+                    // 80% is a real point on this scale and not an arbitrary
+                    // one: pipewire's channelVolumes are the cube of the value
+                    // shown here (measured -- 0.25 here is 0.015625 there), so
+                    // this slider is perceptual, and the notch sits about 5.8dB
+                    // below full rather than the ~2dB it would mean on a linear
+                    // control.
+                    //
+                    // It is still a comfort mark, not a safety one. Hearing
+                    // guidance is in dB SPL over time and depends on what is
+                    // plugged in: this notch is conservative on the internal
+                    // speakers and optimistic on sensitive headphones, because
+                    // slider position says nothing about either.
+                    Rectangle {
+                        x: volTrack.width * volSlider.comfort - width / 2
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 2
+                        height: 8
+                        color: root.bg
+                    }
+                }
+
+                // Fixed width and right-aligned so the track's right-hand end
+                // does not move between "9%" and "100%" -- the same jitter the
+                // glyph column had on the left.
+                Text {
+                    id: volPct
+                    anchors.right: parent.right
+                    anchors.rightMargin: root.inset
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 30
+                    horizontalAlignment: Text.AlignRight
+                    font.family: root.mono
+                    font.pixelSize: 11
+                    color: !volSlider.a ? root.bad : volSlider.a.muted ? root.dim : root.fg
+                    // Nothing to report with no sink -- the red speaker on the
+                    // left is the whole message, and a percentage of nothing
+                    // beside it would just be 0%.
+                    text: volSlider.a ? Math.round(volSlider.level * 100) + "%" : ""
+                }
+
+                MouseArea {
+                    anchors.left: volTrack.left
+                    anchors.right: volTrack.right
+                    anchors.top: parent.top
+                    anchors.bottom: parent.bottom
+                    enabled: !!volSlider.a
+                    // Set on press and keep setting while held, so a click
+                    // jumps and a drag scrubs without needing two code paths.
+                    // No pressed-check in onPositionChanged: a MouseArea only
+                    // reports motion while a button is down unless hoverEnabled
+                    // is set, and it is not.
+                    onPressed: mouse => audio.setLevel(mouse.x / width)
+                    onPositionChanged: mouse => audio.setLevel(mouse.x / width)
+                    onWheel: wheel => audio.bump(wheel.angleDelta.y > 0 ? 0.05 : -0.05)
+                }
+            }
 
             PickerHeading {
                 text: "Output device"
@@ -1968,13 +2336,61 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                     Text {
                         anchors.verticalCenter: parent.verticalCenter
                         anchors.left: parent.left
-                        anchors.leftMargin: 6
+                        anchors.leftMargin: root.inset
                         width: parent.width - 12
                         elide: Text.ElideRight
                         color: sinkRow.isCurrent ? root.accent : root.fg
                         font.family: root.mono
                         font.pixelSize: 12
                         text: (sinkRow.isCurrent ? "* " : "  ") + (sinkRow.modelData.description || sinkRow.modelData.nickname || sinkRow.modelData.name)
+                    }
+                }
+            }
+
+            // Which device the machine records from. Nothing on the bar says
+            // this -- the volume cell is about playback -- so before this list
+            // the only way to find out was wpctl or pavucontrol.
+            //
+            // Worth surfacing because the answer changes under you: plugging in
+            // a USB sound card moves the default capture device as well as the
+            // default output, which is easy to miss when you were only thinking
+            // about playback.
+            PickerHeading {
+                text: "Input device"
+                visible: audio.sources.length > 0
+            }
+
+            Repeater {
+                model: audio.sources
+
+                PickerRow {
+                    id: srcRow
+                    required property var modelData
+                    readonly property bool isCurrent: modelData === audio.source
+                    width: audioCol.width
+                    // Mirrors the sink side: preferredDefaultAudioSource is the
+                    // writable knob, defaultAudioSource follows it.
+                    //
+                    // This changes what *new* streams open by default. An app
+                    // already recording keeps the device it opened with, and
+                    // has to be moved per-stream in pavucontrol's Recording tab
+                    // or restarted -- pipewire routes existing streams, and
+                    // nothing here reaches into them.
+                    onActivated: {
+                        Pipewire.preferredDefaultAudioSource = srcRow.modelData;
+                        root.openPanel = "";
+                    }
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.left: parent.left
+                        anchors.leftMargin: root.inset
+                        width: parent.width - 12
+                        elide: Text.ElideRight
+                        color: srcRow.isCurrent ? root.accent : root.fg
+                        font.family: root.mono
+                        font.pixelSize: 12
+                        text: (srcRow.isCurrent ? "* " : "  ") + (srcRow.modelData.description || srcRow.modelData.nickname || srcRow.modelData.name)
                     }
                 }
             }
@@ -1989,11 +2405,15 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.left: parent.left
-                    anchors.leftMargin: 6
+                    anchors.leftMargin: root.inset
                     color: root.dim
                     font.family: root.mono
                     font.pixelSize: 12
-                    text: "  Open pavucontrol (per-app mixer)..."
+                    // No leading pad. The device rows above spend two columns
+                    // on a "* " marker; this is an action rather than a thing
+                    // that can be current, so it has no marker to leave room
+                    // for and lines up with the headings instead.
+                    text: "Open pavucontrol (per-app mixer)..."
                 }
             }
         }
@@ -2057,7 +2477,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.left: parent.left
-                    anchors.leftMargin: 6
+                    anchors.leftMargin: root.inset
                     color: root.dim
                     font.family: root.mono
                     font.pixelSize: 11
@@ -2067,7 +2487,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.right: parent.right
-                    anchors.rightMargin: 6
+                    anchors.rightMargin: root.inset
                     color: !Networking.wifiHardwareEnabled ? root.bad : Networking.wifiEnabled ? root.accent : root.dim
                     font.family: root.mono
                     font.pixelSize: 11
@@ -2132,6 +2552,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                 PickerHeading { text: "DNS" }
 
                 Row {
+                    leftPadding: root.inset
                     spacing: 4
 
                     SegCell {
@@ -2201,6 +2622,8 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                 // rather than deduce from a browser error.
                 Text {
                     width: parent.width
+                    leftPadding: root.inset
+                    rightPadding: root.inset
                     wrapMode: Text.Wrap
                     color: net.dnsResolving ? root.dim : root.bad
                     font.family: root.mono
@@ -2245,7 +2668,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                         id: sigText
                         anchors.verticalCenter: parent.verticalCenter
                         anchors.left: parent.left
-                        anchors.leftMargin: 6
+                        anchors.leftMargin: root.inset
                         color: netRow.modelData.connected ? root.accent : root.dim
                         font.family: root.mono
                         font.pixelSize: 12
@@ -2269,7 +2692,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                         id: wifiState
                         anchors.verticalCenter: parent.verticalCenter
                         anchors.right: parent.right
-                        anchors.rightMargin: 6
+                        anchors.rightMargin: root.inset
                         color: root.dim
                         font.family: root.mono
                         font.pixelSize: 11
@@ -2398,6 +2821,8 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
 
             Text {
                 width: wifiCol.width
+                leftPadding: root.inset
+                rightPadding: root.inset
                 visible: net.error !== ""
                 wrapMode: Text.Wrap
                 color: root.bad
@@ -2416,7 +2841,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.left: parent.left
-                    anchors.leftMargin: 6
+                    anchors.leftMargin: root.inset
                     color: root.dim
                     font.family: root.mono
                     font.pixelSize: 12
@@ -2503,7 +2928,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.left: parent.left
-                    anchors.leftMargin: 6
+                    anchors.leftMargin: root.inset
                     color: root.dim
                     font.family: root.mono
                     font.pixelSize: 11
@@ -2513,7 +2938,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.right: parent.right
-                    anchors.rightMargin: 6
+                    anchors.rightMargin: root.inset
                     color: !bt.adapter ? root.bad : bt.adapter.enabled ? root.accent : root.dim
                     font.family: root.mono
                     font.pixelSize: 11
@@ -2539,7 +2964,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                     Text {
                         anchors.verticalCenter: parent.verticalCenter
                         anchors.left: parent.left
-                        anchors.leftMargin: 6
+                        anchors.leftMargin: root.inset
                         anchors.right: btState.left
                         anchors.rightMargin: 8
                         elide: Text.ElideRight
@@ -2560,7 +2985,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                         id: btState
                         anchors.verticalCenter: parent.verticalCenter
                         anchors.right: parent.right
-                        anchors.rightMargin: 6
+                        anchors.rightMargin: root.inset
                         color: root.dim
                         font.family: root.mono
                         font.pixelSize: 11
@@ -2593,7 +3018,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.left: parent.left
-                    anchors.leftMargin: 6
+                    anchors.leftMargin: root.inset
                     color: bt.scanning ? root.accent : root.dim
                     font.family: root.mono
                     font.pixelSize: 11
@@ -2607,7 +3032,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.right: parent.right
-                    anchors.rightMargin: 6
+                    anchors.rightMargin: root.inset
                     visible: bt.hidden > 0
                     color: root.dim
                     font.family: root.mono
@@ -2626,7 +3051,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.left: parent.left
-                    anchors.leftMargin: 6
+                    anchors.leftMargin: root.inset
                     color: root.dim
                     font.family: root.mono
                     font.pixelSize: 12
@@ -2754,7 +3179,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                             Text {
                                 anchors.verticalCenter: parent.verticalCenter
                                 anchors.left: parent.left
-                                anchors.leftMargin: 6
+                                anchors.leftMargin: root.inset
                                 width: parent.width - 12
                                 elide: Text.ElideRight
                                 color: modeRow.isCurrent ? root.accent : root.fg
@@ -2790,7 +3215,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                         Text {
                             anchors.verticalCenter: parent.verticalCenter
                             anchors.left: parent.left
-                            anchors.leftMargin: 6
+                            anchors.leftMargin: root.inset
                             color: root.dim
                             font.family: root.mono
                             font.pixelSize: 12
@@ -2812,6 +3237,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                     }
 
                     Row {
+                        leftPadding: root.inset
                         spacing: 4
 
                         Repeater {
@@ -2840,6 +3266,7 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                     }
 
                     Row {
+                        leftPadding: root.inset
                         spacing: 4
                         // Steps of 10 rather than a finer grid: on the internal
                         // panel the backlight has 90 hardware levels, so a
@@ -2954,6 +3381,119 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                         label: modelData.k
                         value: modelData.v
                     }
+                }
+            }
+        }
+    }
+
+    // Battery page: one switch and the one number that is not already on the
+    // bar or the system page.
+    //
+    // Percentage, health and cycle count are deliberately not repeated here --
+    // they are on the system page, and the standing rule in this file is that
+    // two places showing the same number must not be able to disagree. Narrower
+    // than the 530 the system page uses, because two rows of content in 530px
+    // is mostly empty panel.
+    PanelWindow {
+        visible: root.openPanel === "battery"
+        WlrLayershell.layer: WlrLayer.Overlay
+        exclusionMode: ExclusionMode.Ignore
+        anchors {
+            top: true
+            right: true
+        }
+        margins {
+            top: 34
+            right: 8
+        }
+        implicitWidth: 360
+        implicitHeight: batCol.implicitHeight + 20
+        color: root.bg
+
+        Column {
+            id: batCol
+            anchors.fill: parent
+            anchors.margins: 10
+            spacing: 6
+
+            // Segmented chips rather than an On/Off row, matching the DNS
+            // picker. Two named modes both spelled out and one of them lit is
+            // easier to read at a glance than a single label whose state lives
+            // in one word at the far end of the panel -- and it makes the
+            // default visible, which On/Off does not: "Auto" says there is a
+            // normal behaviour to go back to.
+            //
+            // Auto is first for the same reason DHCP is first in that row: it
+            // is the unmodified state, and the overrides follow it.
+            PickerHeading { text: "Sleep" }
+
+            Row {
+                leftPadding: root.inset
+                spacing: 4
+
+                // `awake.running` is both the state and the control -- there is
+                // no separate bool that could disagree with whether the lock is
+                // actually held, so these chips cannot show a mode the machine
+                // is not in.
+                SegCell {
+                    label: "Auto"
+                    active: !awake.running
+                    onActivated: awake.running = false
+                }
+
+                SegCell {
+                    label: "Stay awake"
+                    active: awake.running
+                    // Same caution yellow the bar cell turns, so the chip you
+                    // selected and the colour you then see on the bar are
+                    // visibly the same fact.
+                    activeColor: root.caution
+                    onActivated: awake.running = true
+                }
+            }
+
+            // Says what the selected mode actually does, because "stay awake"
+            // alone does not distinguish it from "keep the screen on" -- which
+            // is the opposite of the intent here.
+            Text {
+                width: batCol.width
+                leftPadding: root.inset
+                rightPadding: root.inset
+                wrapMode: Text.WordWrap
+                color: root.dim
+                font.family: root.mono
+                font.pixelSize: 10
+                text: awake.running
+                    ? "Idle and lid close will not suspend. The screen still blanks and locks. Stays on across shell restarts, but not across a reboot until you log in."
+                    : "Suspends after 15m idle, or on lid close."
+            }
+
+            // Time remaining. UPower reports 0 for "no estimate" rather than a
+            // null, and it does that whenever the battery is neither charging
+            // nor discharging -- on AC at full charge it is 0 in both
+            // directions. Printing that verbatim gives "0m", which reads as an
+            // imminent shutdown. So the state drives the label and the seconds
+            // only ever appear when they mean something.
+            InfoRow {
+                width: batCol.width
+                labelWidth: 78
+                label: "Remaining"
+                value: {
+                    if (!info.batPresent)
+                        return "No battery";
+                    const b = info.bat;
+                    const fmt = s => {
+                        const h = Math.floor(s / 3600);
+                        const m = Math.round((s % 3600) / 60);
+                        return h > 0 ? h + "h " + m + "m" : m + "m";
+                    };
+                    if (b.state === UPowerDeviceState.Discharging)
+                        return b.timeToEmpty > 0 ? fmt(b.timeToEmpty) + " left" : "Estimating";
+                    if (b.state === UPowerDeviceState.Charging)
+                        return b.timeToFull > 0 ? fmt(b.timeToFull) + " to full" : "Charging";
+                    if (b.state === UPowerDeviceState.FullyCharged)
+                        return "Full, on AC";
+                    return "On AC";
                 }
             }
         }
