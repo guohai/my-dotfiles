@@ -1339,6 +1339,61 @@ in
     # The Super+Shift+5 / Super+Ctrl+Shift+5 toggle. Defined in the let block
     # above; it wraps wf-recorder, slurp and niri msg.
     recordCmd
+    # Audio swiss army knife, next to the capture stack because that is what
+    # tends to need it: wf-recorder writes the file, this trims/normalises/
+    # converts it. Also brings `play`, `rec` and `soxi` for one-shot playback,
+    # recording and header inspection without opening a GUI.
+    #
+    # sox_ng, not sox, and the distinction is easy to miss because both attrs
+    # exist in nixpkgs and both install a binary called `sox`:
+    #
+    #   pkgs.sox     14.4.2, a 2021 git snapshot of the SourceForge project,
+    #                whose last real release was 2015 and which is dead.
+    #   pkgs.sox_ng  14.7.1.2, the maintained fork (codeberg.org/sox_ng).
+    #
+    # The fork installs sox/play/rec/soxi under the familiar names -- plus
+    # sox_ng/play_ng/rec_ng/soxi_ng aliases -- so it is a drop-in and no
+    # muscle memory or existing script has to change. It is also linked
+    # against ffmpeg, which is the practical difference: it reads aac, m4a,
+    # mp4, wma, ac3, mkv and webm, where the old one stops at mp3/ogg/flac
+    # and fails on anything that came off a phone or out of a browser.
+    #
+    # Both build `play`/`rec` with the pulseaudio driver, which is what makes
+    # them work here at all -- there is no PulseAudio daemon on this machine,
+    # only pipewire-pulse (services.pipewire.pulse.enable below), and sox
+    # talks to that shim. The alsa driver is also compiled in but would
+    # contend with pipewire for the device; prefer AUDIODRIVER=pulseaudio,
+    # which is already the default it picks.
+    sox_ng
+    # For `pactl`, and only for `pactl`. Reads as a mistake on a machine that
+    # deliberately does not run PulseAudio, so the reasoning is worth keeping:
+    #
+    # pactl is a *client* of the PulseAudio wire protocol, not the server. The
+    # server here is pipewire-pulse (services.pipewire.pulse.enable below),
+    # which implements that protocol precisely so existing clients keep
+    # working -- it is listening on /run/user/1000/pulse/native and pactl
+    # talks to it. Nothing about installing this starts a second sound server.
+    #
+    # It is this attribute because nixpkgs has nowhere else to get the binary:
+    # pipewire ships the pw-* tools, wireplumber ships wpctl, and neither
+    # pulseaudio-ctl nor libpulseaudio contains pactl. There is no
+    # client-tools-only package to prefer.
+    #
+    # Wanted by audictl (npm -g, @agora-build/audictl), which drives the audio
+    # rig in ~/Dev/runAgentLatencyEval and shells out to pactl unconditionally
+    # -- no wpctl or pw-cli fallback and no backend flag, so this is a hard
+    # dependency of that tool rather than a preference.
+    #
+    # The wrinkle to know about. This also puts the `pulseaudio` daemon binary
+    # itself on PATH, alongside pacat/paplay/parec and friends. It will not
+    # run: services.pulseaudio.enable is false and no unit references it. The
+    # one path that could start it is client autospawn, which cannot fire
+    # while pipewire-pulse owns the socket, because clients connect
+    # successfully and never fall through to spawning their own. If
+    # pipewire-pulse were ever down, a stray pactl call could autospawn a real
+    # PulseAudio daemon that then fights pipewire for the devices; `autospawn
+    # = no` in client.conf closes that off if it ever bites.
+    pulseaudio
     # Stays system-level: xremap needs the input/uinput groups and a system
     # udev rule, so managing it per-user would split the config in two.
     xremapNiri
@@ -1906,7 +1961,6 @@ in
       (import "${home-manager}/nixos")
     ];
 
-  # Use the systemd-boot EFI boot loader.
   # PORTABILITY: assumes UEFI. On a BIOS/legacy machine use boot.loader.grub
   # instead, or the system will build but refuse to boot.
   boot.loader.systemd-boot.enable = true;
@@ -2113,6 +2167,27 @@ in
     HandlePowerKey = "suspend";
   };
 
+  # The machine's name, chosen to match the NetBird peer so that the host is
+  # called the same thing everywhere: `nixps` here, nixps.netbird.cloud in the
+  # tunnel. Before this it was never set at all -- `nixos` was simply the
+  # NixOS default for networking.hostName, which is why every machine that
+  # has not been renamed answers to it, and why that name says nothing about
+  # which box you are on when several are open at once.
+  #
+  # This does not touch NetBird. A peer's identity there is its key, not its
+  # name, so renaming the host neither re-registers it nor disturbs the
+  # tunnel; the dashboard name was already set to nixps independently. Worth
+  # stating because the two names now agree by intent rather than mechanism,
+  # and nothing keeps them in step automatically -- rename the peer later and
+  # this line has to be changed by hand.
+  #
+  # What does change: /etc/hosts regenerates its 127.0.0.2 entry, the system
+  # derivation becomes nixos-system-nixps-*, the boot menu entries follow, and
+  # anything showing $hostname (shell prompt, terminal title) says nixps. SSH
+  # host keys are unaffected, so known_hosts on other machines stays valid --
+  # they connect by IP anyway.
+  networking.hostName = "nixps";
+
   # Configure network connections interactively with nmcli or nmtui.
   networking.networkmanager.enable = true;
 
@@ -2194,15 +2269,9 @@ in
   # NetBird IP, set this to "none" and keep strict rp_filter.
   services.netbird.useRoutingFeatures = "client";
 
-  # Set your time zone.
   # PORTABILITY: change to your own zone (`timedatectl list-timezones`).
   time.timeZone = "America/Los_Angeles";
 
-  # Configure network proxy if necessary
-  # networking.proxy.default = "http://user:password@proxy:port/";
-  # networking.proxy.noProxy = "127.0.0.1,localhost,internal.domain";
-
-  # Select internationalisation properties.
   i18n.defaultLocale = "en_US.UTF-8";
   console = {
     # PORTABILITY: 32px console font, sized for this HiDPI/retina panel. On a
@@ -2212,23 +2281,13 @@ in
     keyMap = "us";
   };
 
-  # Enable CUPS to print documents.
+  # Enable CUPS to print documents. Deliberately left off -- there is no
+  # printer attached to this machine today. Uncomment to get the CUPS daemon
+  # and its web UI on http://localhost:631; a real printer will usually also
+  # want a driver (services.printing.drivers) and, if it is on the network
+  # rather than on USB, services.avahi for mDNS discovery.
   # services.printing.enable = true;
 
-  # Enable touchpad support (enabled default in most desktopManager).
-  # services.libinput.enable = true;
-
-  # Some programs need SUID wrappers, can be configured further or are
-  # started in user sessions.
-  # programs.mtr.enable = true;
-  # programs.gnupg.agent = {
-  #   enable = true;
-  #   enableSSHSupport = true;
-  # };
-
-  # List services that you want to enable:
-
-  # Enable the OpenSSH daemon.
   # Password login is requested explicitly. Note that NixOS already defaults
   # PasswordAuthentication to true, but it is spelled out here so that the
   # intent is obvious and a future nixpkgs default flip cannot silently lock
@@ -2253,35 +2312,43 @@ in
     openFirewall = true;
   };
 
-  # Open ports in the firewall.
-  # networking.firewall.allowedTCPPorts = [ ... ];
-  # networking.firewall.allowedUDPPorts = [ ... ];
-  # Or disable the firewall altogether.
-  # networking.firewall.enable = false;
+  # Mosh, which sits on top of the sshd above rather than replacing it: it
+  # logs in over SSH, starts mosh-server on this end, and only then switches
+  # to its own UDP protocol. So services.openssh stays required, and anything
+  # that breaks SSH login breaks mosh login identically.
+  #
+  # What it buys on this machine specifically. A mosh session is bound to a
+  # session key rather than a TCP connection, so it survives the laptop
+  # changing IP, moving between networks, and suspend/resume -- the cases
+  # where SSH silently wedges and has to be killed. It also echoes typing
+  # locally and predictively, which is what makes a high-latency or
+  # cellular-tethered link usable. That is the whole reason it is here: this
+  # box is reached over netbird from wherever it happens to be.
+  #
+  # programs.mosh rather than `mosh` in systemPackages, and the difference is
+  # not cosmetic. The module opens UDP 60000-61000 (openFirewall defaults
+  # true); the bare package does not. The firewall here is enabled with only
+  # `lo` trusted, so traffic arriving over the netbird interface is filtered
+  # like any other -- with the package alone the SSH handshake would succeed
+  # and the session would then hang with no error, which is a genuinely
+  # confusing failure to debug from the far end.
+  #
+  # Note the range is per-session, one UDP port each, so it bounds concurrent
+  # sessions at ~1000 rather than exposing 1000 listeners; ports are only
+  # bound while a session is live.
+  #
+  # Not a full replacement for ssh, and worth knowing before reaching for it
+  # by default: mosh has no port forwarding, no agent forwarding, no X11
+  # forwarding, and no scp/rsync transport. Those still need ssh. Mosh is the
+  # better interactive shell; ssh remains the better tunnel.
+  programs.mosh.enable = true;
 
-  # Copy the NixOS configuration file and link it from the resulting system
-  # (/run/current-system/configuration.nix). This is useful in case you
-  # accidentally delete configuration.nix.
-  # system.copySystemConfiguration = true;
-
-  # This option defines the first version of NixOS you have installed on this particular machine,
-  # and is used to maintain compatibility with application data (e.g. databases) created on older NixOS versions.
-  #
-  # Most users should NEVER change this value after the initial install, for any reason,
-  # even if you've upgraded your system to a new NixOS release.
-  #
-  # This value does NOT affect the Nixpkgs version your packages and OS are pulled from,
-  # so changing it will NOT upgrade your system - see https://nixos.org/manual/nixos/stable/#sec-upgrading for how
-  # to actually do that.
-  #
-  # This value being lower than the current NixOS release does NOT mean your system is
-  # out of date, out of support, or vulnerable.
-  #
-  # Do NOT change this value unless you have manually inspected all the changes it would make to your configuration,
-  # and migrated your data accordingly.
-  #
-  # For more information, see `man configuration.nix` or https://nixos.org/manual/nixos/stable/options#opt-system.stateVersion .
-  system.stateVersion = "26.05"; # Did you read the comment?
+  # The NixOS release whose stateful defaults this machine expects -- not the
+  # version it runs, which comes from the channel. Leave it alone: it exists so
+  # that on-disk data written by older defaults keeps being read the way it was
+  # written, and bumping it can silently migrate that data. Being lower than
+  # the current release is normal and means nothing is out of date.
+  system.stateVersion = "26.05";
 
 }
 
