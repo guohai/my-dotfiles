@@ -1302,6 +1302,38 @@ in
     # self-update is inert and upgrading means bumping the channel and
     # rebuilding. Auth state lands in ~/.codex/, outside this repo.
     codex
+    # Android platform tools: `adb` and `fastboot`, plus the image utilities
+    # (mkbootimg, simg2img, lpmake and friends) that come in the same 17 MB
+    # derivation. This is the whole install -- there is deliberately no
+    # `programs.adb.enable` line, because that option no longer exists:
+    #
+    #   error: The option `programs.adb' can no longer be used since it's been
+    #   removed. This option is no longer needed as systemd 258 handles uaccess
+    #   rules automatically.
+    #
+    # What that module used to do was add the package, install
+    # android-udev-rules, and create an `adbusers` group you had to join --
+    # otherwise the phone showed up as `no permissions` in `adb devices`.
+    # systemd ships that rule itself now (this box runs 260), in
+    # 70-uaccess.rules:
+    #
+    #   SUBSYSTEM=="usb", ENV{ID_USB_INTERFACES}=="*:dc0201:*|*:ff4201:*|*:ff4203:*", \
+    #       ENV{ID_DEBUG_APPLIANCE}="android"
+    #   ENV{ID_DEBUG_APPLIANCE}=="?*", TAG+="uaccess"
+    #
+    # -- matching the ADB, Fastboot and ADB-DbC interface classes and tagging
+    # them `uaccess`, which ACLs the device node to whoever is logged in at the
+    # seat. So no group membership is needed and adding one would do nothing.
+    # It keys off the USB interface class rather than a vendor ID list, which
+    # is why it works for phones that predate any given nixpkgs revision.
+    #
+    # Two things it cannot do for you: USB debugging still has to be enabled in
+    # the phone's developer options, and the first connection pops an RSA
+    # fingerprint prompt on the phone that must be accepted. `adb devices`
+    # showing `unauthorized` means that prompt is waiting, not that the rules
+    # are wrong. Note also that adb forks a background server on localhost:5037
+    # on first use and leaves it running; `adb kill-server` stops it.
+    android-tools
     # Editor. Deliberately not wired to $EDITOR here -- nothing in this config
     # sets that, and changing it would silently redirect git, systemctl edit
     # and visudo for every account at once. Set it per-user if wanted.
