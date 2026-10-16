@@ -589,7 +589,7 @@ let
     }
 
     # Rungs, in order of preference. GPU encode first: this panel is 2560x1600
-    # and the CPU is a dual-core i5-7360U, so x264 at full size drops frames and
+    # and the CPU is a dual-core i7-7660U, so x264 at full size drops frames and
     # pins both cores. VA-API is not a nicety here.
     #
     # Every rung is a real failure mode seen on this machine, not defensive
@@ -635,7 +635,7 @@ in
   # The GPU here is Iris Plus 650 (Kaby Lake, Gen9.5). Without this block the
   # kernel driver is loaded and the desktop composites fine, but there is no
   # userspace VA-API driver, so every video encode and decode runs on a
-  # dual-core i5-7360U in software.
+  # dual-core i7-7660U in software.
   #
   # What it buys, concretely: `screen-record` encodes 2560x1600 H.264 on the
   # GPU instead of pinning both cores with x264 (its CPU fallback exists, but
@@ -729,8 +729,7 @@ in
       #
       # ~/.npm-global rather than the /root/.npm-global an older install used:
       # /root is mode 0700, which is precisely why that one ended up
-      # unreachable from this account (see the claude-code note in
-      # systemPackages).
+      # unreachable from this account.
       #
       # The deliberate trade. Everything under this prefix is imperative and
       # invisible to a rebuild -- it will not be reinstalled on a fresh machine
@@ -761,7 +760,37 @@ in
       # set prefix` specifically will look like it succeeded and have no
       # effect. Change it here instead.
       home.sessionVariables.NPM_CONFIG_PREFIX = "${config.home.homeDirectory}/.npm-global";
-      home.sessionPath = [ "${config.home.homeDirectory}/.npm-global/bin" ];
+      home.sessionPath = [
+        # Claude Code, from Anthropic's native installer, which is its
+        # recommended install: `curl -fsSL https://claude.ai/install.sh | bash`
+        # on a fresh machine. That puts a symlink here pointing into
+        # ~/.local/share/claude/versions/<v> and keeps it current itself. The
+        # installer only *suggests* the PATH change, and in bash syntax, so
+        # this line is the half it leaves to the user; fish's config is a
+        # read-only store file it could not have edited anyway.
+        #
+        # Not systemPackages, although nixpkgs carries claude-code: a store
+        # copy cannot update itself, and the channel was no substitute -- as of
+        # 2026-09-23 the 26.05 release branch had it at 2.1.223, last bumped
+        # 2026-08-06, with newer versions landing only on nixpkgs master. Not
+        # the npm prefix below either, which is where it lived until
+        # 2026-10-16. Nothing outside an interactive lab shell calls `claude`
+        # (no unit, niri bind or bar entry), so a user-level install reaches
+        # everything that needs it.
+        #
+        # First in the list on purpose. home-manager prepends these in order,
+        # so this comes ahead of ~/.npm-global/bin, and a stray
+        # `npm install -g @anthropic-ai/claude-code` cannot shadow the native
+        # build.
+        #
+        # This and everything else in sessionPath reaches a terminal only
+        # through hm-session-vars, which runs once per login: niri's
+        # environment already carries __HM_SESS_VARS_SOURCED=1, every terminal
+        # inherits it, and the script returns early. A change here therefore
+        # needs a logout, not just a switch and a new tab.
+        "${config.home.homeDirectory}/.local/bin"
+        "${config.home.homeDirectory}/.npm-global/bin"
+      ];
 
       programs.fish = {
         enable = true;
@@ -877,19 +906,22 @@ in
           buffer_font_size = 14;
           ui_font_size = 15;
 
-          # Off by default in Zed, and it phones home on every keystroke
-          # otherwise.
+          # Both on by default in Zed: diagnostics sends crash reports, metrics
+          # sends anonymized usage data such as which languages are in use.
           telemetry = {
             diagnostics = false;
             metrics = false;
           };
 
-          # Zed ships an AI panel that is on by default; this hides it rather
-          # than leaving a dead button in the corner.
+          # Turns off edit predictions, the inline AI completions that Zed
+          # otherwise serves from its own "zed" provider. It does not touch
+          # the agent panel, which is a separate setting (agent.enabled) and
+          # stays on.
           features.edit_prediction_provider = "none";
 
-          # nixd needs to be told which flake/expression to evaluate. This
-          # points it at the system config so option completion works.
+          # Formatting only. nixd needs no expression configured to complete:
+          # it falls back to its built-in defaults, `import <nixpkgs> { }` for
+          # packages and a default NixOS options expression for option names.
           lsp.nixd.settings.formatting.command = [ "nixfmt" ];
 
           languages.Nix.formatter.external = {
@@ -913,8 +945,9 @@ in
         # "cmd" and "win" as aliases -- verified against the binary's own
         # keymap docstring in 1.3.6).
         #
-        # Avoided: super-e and super-q, which niri takes globally for nautilus
-        # and close-window and so never reach Zed either.
+        # Avoided: super-q, which niri takes globally for close-window and so
+        # never reaches Zed either. super-e is free: nautilus is on Mod+E, and
+        # niri's Mod is Alt here (mod-key "Alt" in config.kdl), not Super.
         userKeymaps = [
           {
             context = "Workspace";
@@ -986,9 +1019,10 @@ in
           # players do.
           subs-with-matching-audio = true;
 
-          # No OSD spam on every property change.
+          # The on-screen bar for seek and volume changes. This is mpv's
+          # default already.
           osd-bar = true;
-          # Screenshots land next to the wallpaper rather than in $PWD.
+          # Screenshots land in ~/Pictures/mpv rather than in $PWD.
           screenshot-directory = "~/Pictures/mpv";
           screenshot-format = "png";
         };
@@ -1012,8 +1046,8 @@ in
 
       # --- Clipboard ---
       # cliphist watches the Wayland selection and keeps a searchable history.
-      # Bound to Mod+V in niri (see the note in config.kdl about why not
-      # Super+Shift+V).
+      # Bound to Mod+Shift+C in niri (see the note in config.kdl about why not
+      # Super+Shift+V or Mod+V).
       services.cliphist.enable = true;
 
       # Mac parity fix, not a nicety: on Wayland the clipboard lives in the
@@ -1027,9 +1061,10 @@ in
 
       # --- Idle / lock ---
       # niri implements ext_session_lock_manager_v1 and ext_idle_notifier_v1,
-      # which is what swaylock and swayidle respectively speak. Nothing was
-      # driving them before: the Super+Alt+L bind in niri's config.kdl points
-      # at swaylock, but swaylock was never installed, so it did nothing.
+      # which is what swaylock and swayidle respectively speak. Nothing drove
+      # them originally: the old Super+Alt+L bind in niri's config.kdl pointed
+      # at swaylock, which was never installed, so it did nothing. The lock
+      # bind is now Super+Ctrl+Q, spawning lock-screen.
       #
       # package is swaylock-effects (see swaylockPkg in the let block) so the
       # lock screen gets a wallpaper, clock, blur and fade-in. Nothing here
@@ -1180,7 +1215,7 @@ in
         # channel embedded in the link, which is what ddcutil does: VCP feature
         # 0x10 is luminance, so `ddcutil setvcp 10 60` is the whole operation.
         #
-        # Needs hardware.i2c.enable below for the /dev/i2c-* nodes and the i2c
+        # Needs hardware.i2c.enable above for the /dev/i2c-* nodes and the i2c
         # group, and the user in that group; without both, ddcutil sees no
         # displays and the bar silently falls back to showing nothing for
         # external brightness.
@@ -1198,7 +1233,7 @@ in
         # GTK4, sidebar of bookmarks, type-ahead search, tabs, split view.
         # Launch with Mod+E (see ~/.config/niri/config.kdl). Its supporting
         # services -- gvfs, udisks2, the open-in-terminal extension -- are
-        # enabled at system level above.
+        # enabled at system level further down.
         pkgs.nautilus
 
         # ffmpeg CLI tools: ffmpeg, ffprobe, ffplay.
@@ -1253,7 +1288,7 @@ in
   # Normal (non-root) desktop account. Chrome and other browsers refuse to run
   # as root without --no-sandbox, so log into niri as this user, not as root.
   # PORTABILITY: the username `lab` is hardcoded here AND in
-  # `home-manager.users.lab` further down. Rename BOTH together, or
+  # `home-manager.users.lab` above. Rename BOTH together, or
   # home-manager will happily configure a user that does not exist.
   users.users.lab = {
     isNormalUser = true;
@@ -1261,7 +1296,7 @@ in
     # input  -> read /dev/input/event* (xremap grabs the keyboard)
     # uinput -> write /dev/uinput (xremap emits the rewritten events)
     # i2c    -> write /dev/i2c-* (ddcutil drives external monitor brightness
-    #           over DDC/CI; see hardware.i2c.enable below). Adding a group
+    #           over DDC/CI; see hardware.i2c.enable above). Adding a group
     #           does not affect an already-running session -- the credentials
     #           were fixed at login -- so this one needs a full logout before
     #           the bar's brightness rows can reach an external panel.
@@ -1276,16 +1311,6 @@ in
 
   environment.systemPackages = with pkgs; [
     nodejs
-    # Installed system-wide so every account gets it. The old npm -g install
-    # lived under /root/.npm-global, which is unreachable from the lab user
-    # because /root is mode 0700. Self-update is disabled (read-only Nix
-    # store); bump the channel and rebuild to upgrade.
-    #
-    # This is not an argument against npm -g in general -- there is a working
-    # user-level prefix for that in home-manager.users.lab, and it is the right
-    # tool for a CLI nixpkgs does not carry. It is an argument for preferring
-    # nixpkgs when nixpkgs has the package, which it does here.
-    claude-code
     git
     # ncurses browser for git history. Reads the repo directly, no daemon and
     # no config of its own; `tig` in any working tree is the whole interface.
@@ -1297,10 +1322,12 @@ in
     # ~/.config/gh/hosts.yml in plaintext. That path is outside this repo, but
     # it is worth knowing about before backing up ~/.config wholesale.
     gh
-    # Second coding agent alongside claude-code, and system-wide for the same
-    # reason: nixpkgs carries it. The Nix store is read-only, so its
-    # self-update is inert and upgrading means bumping the channel and
-    # rebuilding. Auth state lands in ~/.codex/, outside this repo.
+    # Coding agent, installed system-wide because nixpkgs carries it. The Nix
+    # store is read-only, so its self-update is inert and upgrading means
+    # bumping the channel and rebuilding. Auth state lands in ~/.codex/,
+    # outside this repo. (claude-code is not here: it comes from Anthropic's
+    # native installer into ~/.local/bin -- see home.sessionPath in
+    # home-manager.users.lab for why.)
     codex
     # Android platform tools: `adb` and `fastboot`, plus the image utilities
     # (mkbootimg, simg2img, lpmake and friends) that come in the same 17 MB
@@ -1346,6 +1373,12 @@ in
     # does not affect Nix builds, which run sandboxed without systemPackages.
     # Use binutils-unwrapped instead if the bare linker on PATH is unwanted.
     binutils
+    # Info-ZIP UnZip 6.00: unzip, zipinfo, zipgrep, funzip and unzipsfx, 568K.
+    # Extract only -- creating archives is the separate `zip` attr, which is
+    # not installed. An APK is a zip, so `unzip -l app.apk` lists one, and
+    # `dialf import` wants an already-extracted folder, not the zip that
+    # `dialf export` writes.
+    unzip
     google-chrome
     fuzzel
     wl-clipboard
@@ -1353,12 +1386,12 @@ in
     tuigreet
     # Referenced by binds already present in ~/.config/niri/config.kdl that
     # were silently dead because the binaries were never installed:
-    #   XF86MonBrightnessUp/Down -> brightnessctl  (config.kdl:402-403)
-    #   XF86AudioPlay/Next/Prev  -> playerctl      (config.kdl:394-397)
+    #   XF86MonBrightnessUp/Down, XF86KbdBrightnessUp/Down -> brightnessctl
+    #   XF86AudioPlay/Stop/Prev/Next                       -> playerctl
     brightnessctl
     playerctl
-    # Capture stack. niri screenshots natively (Print / Ctrl+Print / Alt+Print,
-    # config.kdl:~640) but cannot annotate, so grim+slurp feed satty for the
+    # Capture stack. niri screenshots natively (Print / Ctrl+Print / Alt+Print
+    # in config.kdl) but cannot annotate, so grim+slurp feed satty for the
     # Super+Shift+3/4 binds.
     #
     # All four talk zwlr_screencopy_manager_v1 directly to niri. Nothing here
@@ -1558,7 +1591,7 @@ in
   # the manager ship in one package and splitting them would mean an overlay
   # rebuilding blueman to delete one binary -- but nothing launches it any more.
   # The applet that actually registers the agent is started per-user by
-  # home-manager below.
+  # home-manager above (services.blueman-applet).
   services.blueman.enable = true;
 
   # ...and exactly once. This package ships an XDG autostart entry at
@@ -2258,6 +2291,23 @@ in
   services.resolved.enable = true;
   networking.networkmanager.dns = "systemd-resolved";
 
+  # Hand mDNS to Avahi. resolved ships its own mDNS responder and it is on by
+  # default -- `resolvectl status` showed "+mDNS" and "Current Scopes: ...
+  # mDNS/IPv4 mDNS/IPv6", and resolved held 0.0.0.0:5353 before this line
+  # existed. Two responders on one host is not a port clash that fails loudly:
+  # both bind 5353 with SO_REUSEADDR, both join the multicast group, so both
+  # receive every query and both answer. Avahi then sees another host claiming
+  # nixps.local, declares a name conflict and renames itself to nixps-2.local
+  # -- which looks like an Avahi bug and is really two daemons doing the same
+  # job. Only one may own the port, and it has to be Avahi here because
+  # avahi-publish talks to avahi-daemon over D-Bus and has no resolved
+  # equivalent (resolved's static .dnssd files cannot be driven by a CLI).
+  #
+  # This is only the multicast scope. resolved keeps doing unicast DNS, which
+  # is the part NetBird depends on -- the ~netbird.cloud routing domain on wt0
+  # described above is a unicast split-DNS route and is untouched by this.
+  services.resolved.settings.Resolve.MulticastDNS = "no";
+
   # --- NetBird (netbird.io) ---
   # WireGuard-based mesh VPN. `enable = true` is the module's backward-compatible
   # single-client shortcut and is exactly equivalent to:
@@ -2316,9 +2366,81 @@ in
   # Enable CUPS to print documents. Deliberately left off -- there is no
   # printer attached to this machine today. Uncomment to get the CUPS daemon
   # and its web UI on http://localhost:631; a real printer will usually also
-  # want a driver (services.printing.drivers) and, if it is on the network
-  # rather than on USB, services.avahi for mDNS discovery.
+  # want a driver (services.printing.drivers). A network printer is found
+  # over mDNS, which the services.avahi block below already provides.
   # services.printing.enable = true;
+
+  # mDNS/DNS-SD, here for exactly one consumer: dialfd advertises itself on the
+  # LAN so the phone app can find it instead of being handed a typed-in IP.
+  # Without this it logs "avahi-publish is not installed (or not on the
+  # daemon's PATH)" and falls back to no discovery at all.
+  #
+  # Enabling the service is also what installs the binary -- the module adds
+  # pkgs.avahi to systemPackages, which lands avahi-publish in
+  # /run/current-system/sw/bin, first on the PATH that dialfd's user unit
+  # inherits. So there is no separate package line to add, and adding one would
+  # give a second copy that the daemon would never reach first anyway.
+  #
+  # publish.enable is the master switch; publish.userServices is the one that
+  # actually matters here, because avahi-publish registers through D-Bus as an
+  # unprivileged user and that path is refused unless it is set (it renders
+  # disable-user-service-publishing=no). It also implies publish-addresses, so
+  # nixps.local resolves to this host as a side effect.
+  services.avahi = {
+    enable = true;
+    openFirewall = true;
+    publish = {
+      enable = true;
+      userServices = true;
+    };
+
+    # Keep mDNS off the netbird tunnel and the docker bridge. Avahi binds every
+    # interface by default, and multicast on a point-to-point WireGuard link is
+    # pointless rather than useful -- it cannot reach the LAN the phone is on,
+    # and it would put an unnecessary listener in front of every netbird peer.
+    # Written as a deny list rather than allowInterfaces = [ "wlp2s0" ] on
+    # purpose: an allow list silently stops advertising the day this machine is
+    # on ethernet or the wireless interface is renamed, and the failure looks
+    # like "the phone stopped seeing it" with nothing in the log.
+    denyInterfaces = [ "wt0" "docker0" ];
+
+    # Resolving .local names, as opposed to publishing them. This is here to
+    # avoid a regression rather than to add a feature: resolved was answering
+    # .local queries until MulticastDNS=no turned that off above, and without
+    # this the box would publish nixps.local while being unable to look up
+    # anyone else's. dialf does not need it -- the phone does the resolving.
+    #
+    # It edits the hosts line in nsswitch.conf, which is worth being careful
+    # about on a machine where NetBird owns DNS. It is safe because of what
+    # the _minimal suffix means: mdns4_minimal answers .local and nothing
+    # else, returning UNAVAIL for other names so the lookup falls through. The
+    # module places it as `mdns4_minimal [NOTFOUND=return]` ahead of resolve
+    # and a bare `mdns4` after dns; the bracket only short-circuits a .local
+    # name that mDNS already said does not exist, sparing it a doomed unicast
+    # query. netbird.cloud is not .local, so it still reaches resolve exactly
+    # as before. v4 only -- v6 mDNS would be a second nsswitch entry earning
+    # nothing on a LAN that answers over v4.
+    nssmdns4 = true;
+  };
+
+  # dialfd's control port. Discovery and reachability are two separate things
+  # and both have to be granted: mDNS above is how the phone *finds* the
+  # daemon, this is how it then *connects*. With only one of the two the
+  # failure is confusing -- the daemon appears in the phone's list and then
+  # times out on connect.
+  #
+  # dialfd binds 0.0.0.0:8765, so the port is the only gate. Opened globally
+  # rather than scoped to the wireless interface, matching how ssh and mosh are
+  # handled here: an interface-scoped rule silently stops working the day this
+  # machine is on ethernet or the wireless interface is renamed, and a tablet
+  # that cannot connect is a much harder thing to debug than a port that is
+  # open. Note the consequence -- anything on the LAN can reach dialfd, and
+  # dialf's shared_key in ~/.config/dialf/config.yaml is the whole of the
+  # authentication. Change it from the default before using this on a network
+  # you do not control. Unlike UDP 5353, this one is deliberately not kept off
+  # wt0: reaching the daemon from a NetBird peer is useful, and Avahi is
+  # excluded there only because multicast cannot cross the tunnel anyway.
+  networking.firewall.allowedTCPPorts = [ 8765 ];
 
   # Password login is requested explicitly. Note that NixOS already defaults
   # PasswordAuthentication to true, but it is spelled out here so that the
