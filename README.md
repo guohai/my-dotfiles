@@ -5,7 +5,8 @@ Mac-style keyboard layer, a hand-written [Quickshell](https://quickshell.org) ba
 and a blurred-wallpaper lock screen.
 
 Built and running on NixOS **26.05** on a MacBookPro14,1 (13-inch Intel, 2017).
-Everything except the camera driver and the bootloader is hardware-agnostic.
+Everything except the camera driver, the bootloader and
+`nixos/hardware-macbookpro14.nix` is hardware-agnostic.
 
 ---
 
@@ -45,8 +46,8 @@ Everything below is declared in `nixos/configuration.nix` — there is nothing t
 | **mpv** | Video player, with a hardware-decode + high-quality-scaling config. |
 | **Nautilus** | GNOME file manager, plus `nautilus-open-any-terminal` wired to kitty. |
 | **pavucontrol** | Full audio mixer, for when the bar's picker isn't enough. |
+| **bluetui** | Terminal Bluetooth manager — profiles, codecs, pairing — opened from the bar's Bluetooth picker. |
 | **luvus** | Vendored from `nixos/pkgs/luvus.nix` — not in nixpkgs. |
-| **Claude Code** | Anthropic's CLI. |
 
 ### Screenshots, recording, media
 
@@ -55,6 +56,8 @@ Everything below is declared in `nixos/configuration.nix` — there is nothing t
 | **grim + slurp + satty** | Screenshots. `⌘+Shift+3` whole screen, `⌘+Shift+4` drag a region — both open satty to annotate, then copy to the clipboard and save to `~/Pictures/Screenshots/`. niri's own `Print` / `Ctrl+Print` / `Alt+Print` are also bound — picker / whole screen / focused window, saved straight to disk with no annotation step — but an Apple keyboard has no Print key. |
 | **wf-recorder** | Screen recording, driven by the `screen-record` toggle (defined in `configuration.nix`). `⌘+Shift+5` records the focused screen, `⌘+Ctrl+Shift+5` drags a region. Press the same chord again to stop — either one stops a recording, whichever started it. Video goes to `~/Videos/Screen Recording <date>.mp4` and its path lands on the clipboard when you stop. Records system audio by default (`screen-record full mute` from a shell for silent). H.264 on the GPU via VA-API, falling back to x264 on the CPU. |
 | **ffmpeg-full** | Full ffmpeg with every codec and filter enabled. |
+| **sox** (`sox_ng`) | Audio trim/convert/record, plus `play`, `rec`, `soxi`. The maintained fork rather than `pkgs.sox`, and linked against ffmpeg, so it reads m4a/aac/webm too. |
+| **pactl** | From the `pulseaudio` package, for the client only — it drives PipeWire through pipewire-pulse. The PulseAudio daemon is never started. |
 | **playerctl** | Media keys (play/pause/next) against MPRIS. |
 | **wl-clipboard + cliphist + wl-clip-persist** | Clipboard, searchable clipboard history, and clipboard survival after the source app closes. |
 
@@ -66,6 +69,7 @@ Everything below is declared in `nixos/configuration.nix` — there is nothing t
 | **BlueZ + blueman** | Bluetooth, with the applet autostarted. A `bluetooth-uart-recover` unit re-probes the controller at boot when it fails to come up — see below. |
 | **upower**, **power-profiles-daemon** | Battery reporting and power profile switching. |
 | **brightnessctl** | Backlight keys. |
+| **ddcutil** | External-monitor brightness from the bar, over DDC/CI (`hardware.i2c`; your user is in the `i2c` group). |
 | **gvfs** | Trash, MTP, and network mounts for Nautilus. |
 | **polkit** | Privilege prompts for GUI apps. |
 | **facetimehd** | Apple Intel Mac internal camera. *Delete this on any other machine.* |
@@ -76,7 +80,10 @@ Everything below is declared in `nixos/configuration.nix` — there is nothing t
 | --- | --- |
 | **NetworkManager** | Wifi and wired, driven from the bar. |
 | **NetBird** | Overlay VPN / mesh network. Starts at boot; log in with `netbird up`. |
+| **systemd-resolved** | DNS, per link, so NetBird's `netbird.cloud` names and the LAN's DHCP nameserver coexist after moving networks. Its own mDNS is off — Avahi owns that. |
 | **OpenSSH** | sshd with password auth on, `PermitRootLogin = "prohibit-password"`, firewall port opened. |
+| **mosh** | Roaming shell on top of sshd — survives IP changes and suspend. Opens UDP 60000–61000. |
+| **Avahi** | mDNS publishing (`avahi-publish`) and `.local` lookups. Here for dialf, whose daemon advertises itself to the phone app; its TCP 8765 is opened too. Kept off the NetBird and Docker interfaces. |
 
 ### Development
 
@@ -85,8 +92,20 @@ Everything below is declared in `nixos/configuration.nix` — there is nothing t
 | **git**, **Node.js** | |
 | **tig** | ncurses browser for git history. `tig` in any working tree. |
 | **gh** | GitHub CLI — PRs, issues, releases. `gh auth login` also sets it up as a git credential helper over HTTPS. Note it writes an OAuth token in plaintext to `~/.config/gh/hosts.yml`. |
+| **codex** | OpenAI's coding agent, from nixpkgs. |
+| **neovim** | Installed, but not wired to `$EDITOR`. |
+| **binutils** | `strings`, `objdump`, `nm`, `readelf`. |
+| **android-tools** | `adb` and `fastboot`. No `programs.adb` or `adbusers` group — that option was removed in 26.05, and systemd's own uaccess rules grant device access now. |
+| **unzip** | Extract only; `zip` is not installed. |
 | **Docker** | With weekly `autoPrune`. Your user is in the `docker` group. |
 | **nix-ld** | Lets unpatched dynamically-linked binaries (downloaded toolchains, language servers) run on NixOS. |
+| **`npm install -g`** | Works out of the box: the global prefix is `~/.npm-global`, on PATH. For CLIs nixpkgs does not carry. |
+
+### Installed separately, not by this config
+
+| | |
+| --- | --- |
+| **Claude Code** | Anthropic's native installer, which self-updates: `curl -fsSL https://claude.ai/install.sh \| bash`. It lands in `~/.local/bin`, which the config already puts on PATH. Not from nixpkgs, because the 26.05 release channel lagged upstream by weeks and a store copy cannot update itself. |
 
 ---
 
@@ -95,6 +114,8 @@ Everything below is declared in `nixos/configuration.nix` — there is nothing t
 | Path | What it is |
 | --- | --- |
 | `nixos/configuration.nix` | The whole system. Also contains the entire home-manager config inline. |
+| `nixos/hardware-macbookpro14.nix` | Hand-written quirks for this chassis only: internal speakers, trackpad re-probe after resume, keyboard backlight driven by the ambient light sensor. Imported by `configuration.nix`; drop the import on other hardware. |
+| `nixos/pkgs/snd-hda-codec-cs8409-apple.nix` | Replacement CS8409 codec driver that programs the speaker amplifiers the mainline one leaves muted. Used by `hardware-macbookpro14.nix`. |
 | `nixos/pkgs/luvus.nix` | Vendored package for [luvus](https://luvus.dev), not yet in nixpkgs. |
 | `nixos/pkgs/swaylock-effects-weekday.patch` | Adds `--weekstr` and `--batstr` to swaylock-effects, for a four-line lock clock with a live battery readout. |
 | `config/niri/config.kdl` | niri compositor: keybinds, layout, window rules. Hand-managed. |
@@ -196,7 +217,7 @@ machine-specific line is also marked inline:
 grep -n 'PORTABILITY:' nixos/configuration.nix
 ```
 
-At minimum you will want to change the **username** (it is `brent` in this repo),
+At minimum you will want to change the **username** (it is `lab` in this repo),
 the **timezone**, and delete the **FaceTime HD camera** block unless you are also
 on an Intel Mac.
 
@@ -207,9 +228,14 @@ on an Intel Mac.
 # relative path. Copy the whole directory -- missing any one file is an
 # eval error before the build even starts, e.g.
 #   error: path '/etc/nixos/pkgs/swaylock-effects-weekday.patch' does not exist
+#
+# hardware-macbookpro14.nix is imported the same way. On any machine other
+# than a MacBookPro14,1, skip that copy and delete the import line from
+# configuration.nix instead -- everything in it is chassis-specific.
 sudo mkdir -p /etc/nixos/pkgs
-sudo cp nixos/configuration.nix /etc/nixos/configuration.nix
-sudo cp nixos/pkgs/*            /etc/nixos/pkgs/
+sudo cp nixos/configuration.nix         /etc/nixos/configuration.nix
+sudo cp nixos/hardware-macbookpro14.nix /etc/nixos/hardware-macbookpro14.nix
+sudo cp nixos/pkgs/*                    /etc/nixos/pkgs/
 
 sudo nixos-rebuild switch
 
@@ -243,6 +269,9 @@ mkdir -p ~/.config/niri ~/.config/quickshell ~/.config/xremap
 cp config/niri/config.kdl      ~/.config/niri/
 cp config/quickshell/shell.qml ~/.config/quickshell/
 cp config/xremap/config.yml    ~/.config/xremap/
+
+# Claude Code is not part of the Nix config (see "Installed separately").
+curl -fsSL https://claude.ai/install.sh | bash
 ```
 
 ### 5. Reboot
@@ -286,9 +315,11 @@ the system builds fine and then refuses to boot.
 - **`time.timeZone`** — set to `America/Los_Angeles`.
 - **`console.font = "ter-v32n"`** — a 32px console font, chosen for a HiDPI
   retina panel. On a 1080p screen it is comically large; try `ter-v16n`.
-- **Username `brent`** — hardcoded in `users.users.brent`,
-  `home-manager.users.brent`, and the `--user brent` flag on tuigreet. Rename
-  **all** of them (`sed -i 's/\bbrent\b/YOURNAME/g' nixos/configuration.nix`).
+- **Username `lab`** — hardcoded in `users.users.lab`,
+  `home-manager.users.lab`, and the `--user lab` flag on tuigreet. Rename
+  **all** of them. `lab` is a common word, so review a blind
+  `sed -i 's/\blab\b/YOURNAME/g' nixos/configuration.nix` with `git diff`
+  before rebuilding.
   If you rename only the system account, the build still succeeds and
   home-manager silently configures a user that does not exist.
 - **Monitor layout** — the `output "eDP-1"` block in `config/niri/config.kdl` is
@@ -300,7 +331,7 @@ the system builds fine and then refuses to boot.
 
 The niri/Quickshell desktop, terminals (kitty + foot), fish, Zed, mpv, the lock
 screen, the audio/bluetooth/wifi pickers, clipboard history, screenshots and
-screen recording, NetBird, and sshd.
+screen recording, NetBird, sshd and mosh.
 
 ---
 
@@ -356,8 +387,8 @@ resolution from `niri msg outputs`.
 **Do not put comments between the flags in the lock command.** Every line there
 ends in a backslash, so a `#` on its own line does not start a comment — it eats
 the rest of the joined line and terminates the command early, silently dropping
-every flag after it. Because the wrapper uses `exec`, nothing reports an error;
-you just get a lock screen with the wrong colours.
+every flag after it. swaylock still exits 0, so the wrapper's status check does
+not catch it either; you just get a lock screen with the wrong colours.
 
 **swaylock-effects is patched for a four-line clock.** Stock swaylock-effects
 has exactly two text slots — `--timestr` (large) and `--datestr` (small, under
@@ -445,9 +476,11 @@ uses for the screenshot binds, already proven working here. If you ever want a
 GUI recorder back, check whether `pipewiresrc` has learned to negotiate
 modifiers first — otherwise it will fail exactly the same way.
 
-**Idle auto-suspend is off, because the SSD does not survive suspend.** Worth
-reading before turning it back on, and worth reading for the diagnosis, which
-went through two wrong answers first.
+**Suspend works here only because of three fixes, and the SSD was the hard
+one.** Idle auto-suspend (900 s) and lid-close suspend were both off for a
+while; both are back on now. Worth reading before touching any of the settings
+below, and worth reading for the diagnosis, which went through two wrong answers
+first.
 
 The symptom was reported as a lock-screen problem: *"the screen goes off, then
 my password is always wrong and the only way back is a reboot."* That points
@@ -485,32 +518,40 @@ under `deep`, identically) and `facetimehd` (it deinitialises immediately before
 every hang and leaks memory doing it, but a suspend with the module `rmmod`-ed
 first hung anyway).
 
-The current mitigation is three settings that need no patched kernel —
+The NVMe mitigation is three settings that need no patched kernel —
 `nvme_core.default_ps_max_latency_us=0` to disable APST, `pcie_aspm=off` because
 `nvme_suspend()` also takes the safe shutdown path when ASPM is off on the
 device, and an `nvme-no-d3cold` unit holding the NVMe and its root port out of
 D3cold. The ASPM reasoning is inferred from the driver's logic rather than
-confirmed. If suspend still dies, the definitive fix is patching `106b:2003`
+confirmed. If suspend ever dies again, the definitive fix is patching `106b:2003`
 into `nvme_id_table` with `NVME_QUIRK_SIMPLE_SUSPEND`, which costs a full kernel
-build on a 2017 dual-core. Re-enable the 900 s timer only once a suspend has
-actually been watched to come back.
+build on a 2017 dual-core.
 
-Closing the lid does not suspend either, for the same reason —
-`HandleLidSwitch` and `HandleLidSwitchExternalPower` are both `lock`. Disabling
-the idle timer only closed the unattended route into it; shutting the lid still
-walked straight in. Note that logind does not lock anything itself when
-set to `lock`, it only emits a Lock signal on the session bus, so swayidle needs
-a matching `lock` event or the lid does nothing at all — the two have to move
-together. The cost is that a closed laptop now stays awake and will run its
-battery flat in a bag. That is a deliberate trade against losing the session,
-and it reverts to `suspend` along with the 900 s timer once resume is proven.
+The other two fixes: `mem_sleep_default=s2idle`, because `deep` hung outright
+(see above), and a udev rule in `hardware-macbookpro14.nix` that keeps the Intel
+LPSS SPI controller — the one the keyboard and trackpad hang off — from
+runtime-suspending underneath its driver, which had been stretching suspend
+entry to 38–79 s. Separately, `pcie_port_pm=off` cuts the Thunderbolt
+controller's resume stall from minutes to seconds; it does not make Thunderbolt
+survive s2idle, so external USB-C stays dead until a reboot after any suspend.
 
-Two smaller things came out of the same investigation. `lock-screen` now exits
-early if a locker is already running: the 300 s timeout and the `before-sleep`
-hook both ask to lock, only one client can hold `ext_session_lock_v1`, and the
-loser was logging `refusing lock as already locked` / `Failed to daemonize` on
-every single idle suspend — harmless, but enough routine noise to bury a real
-failure. And the lock screen now passes `--show-failed-attempts` and
+With all of that in place, the 900 s swayidle timer suspends again and
+`HandleLidSwitch` / `HandleLidSwitchExternalPower` are back to `suspend`. If
+suspend starts losing sessions again, comment out the 900 s timer first — it is
+the only thing that suspends the machine unattended — and set the lid to `lock`
+as a stopgap. Note that logind does not lock anything itself when set to
+`lock`, it only emits a Lock signal on the session bus, so swayidle's matching
+`lock` event (still configured) is what makes that work.
+
+Two smaller things came out of the same investigation. `lock-screen` treats
+"already locked" as success: the 300 s timeout and the `before-sleep` hook both
+ask to lock, only one client can hold `ext_session_lock_v1`, and the loser was
+logging `refusing lock as already locked` / `Failed to daemonize` on every
+single idle suspend — harmless, but enough routine noise to bury a real
+failure. It detects this from niri's refusal rather than by checking for a
+running `swaylock` process: a live swaylock may still be starting up or exiting
+after an unlock, and an earlier `pgrep` pre-check let the machine suspend with
+the desktop on screen. And the lock screen now passes `--show-failed-attempts` and
 `--indicator-caps-lock`, because "it says my password is wrong" had no
 observable detail behind it: a stray character from the keypress that woke the
 panel, Caps Lock left on, and a modifier stuck across a resume all look
@@ -549,11 +590,24 @@ count of what was held back is printed next to the scan row, so an empty result
 reads as *"nothing here is announcing itself"* rather than *"the radio is
 broken"*.
 
-**NetBird runs unhardened.** Hardened mode uses `ProtectSystem = "strict"`
-(read-only `/etc`) and its DNS integration assumes systemd-resolved. This system
-uses openresolv, which needs to write `/etc/resolv.conf`. If you run
-systemd-resolved, switch it to `hardened = true` and add your user to the
-`netbird` group.
+**DNS goes through systemd-resolved, for NetBird's sake.** Under openresolv,
+NetBird registers its resolver *exclusively* and forwards everything else to the
+upstream it captured at boot, which is never refreshed. Move the laptop to
+another network and every public name dies while routing stays perfect —
+`ping 8.8.8.8` works, `ping` a hostname does not. resolved is per-link: NetBird
+gets a `~netbird.cloud` routing domain on `wt0` and nothing else, and
+NetworkManager keeps feeding resolved the current DHCP nameserver.
+
+resolved's own mDNS responder is turned off (`MulticastDNS=no`) because Avahi
+owns mDNS here. Two responders on one host both answer every query, and Avahi
+then renames itself over a conflict with its own machine. Unicast DNS, which is
+all NetBird uses, is unaffected.
+
+**NetBird still runs unhardened.** Hardened mode uses `ProtectSystem = "strict"`
+(read-only `/etc`), which was incompatible with openresolv writing
+`/etc/resolv.conf`. With resolved in place that blocker is gone, and hardening
+is deferred only so the DNS switch could be verified on its own first. When
+flipped (`hardened = true`), add your user to the `netbird` group.
 
 ---
 
