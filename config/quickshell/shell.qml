@@ -369,6 +369,156 @@ ShellRoot {
             }
         }
 
+        // Charge rate for the battery popup: watts going *into the battery*.
+        //
+        // That is not the same number as the adapter's output, and the popup
+        // labels it accordingly. On AC the adapter feeds the whole machine as
+        // well as the cell, so its draw is this plus the system load. The
+        // adapter's own figure exists only inside the Apple SMC, and selecting
+        // an SMC key goes through applesmc's key_at_index, which is root-only;
+        // ADP1 in sysfs publishes `online` and nothing else. So the bar reports
+        // the part it can measure honestly rather than estimate the rest.
+        //
+        // NaN rather than -1 for "unknown", because current_now is signed on
+        // some drivers (negative while discharging) and -1 would be a real
+        // reading there. Number() trims the trailing newline sysfs writes.
+        //
+        // The sign cannot be trusted for direction either way: on this
+        // machine's driver it is *unsigned* -- measured with the cable out,
+        // status Discharging, current_now read +1181000. So the magnitude comes
+        // from current/power and the direction from `status`, read alongside
+        // them so the two cannot be from different moments by more than a poll.
+        // That matters with the cable in: an adapter too small for the load
+        // leaves the cell discharging while `online` is 1, and the popup must
+        // not call that power going into the battery.
+        property real batPower: NaN     // uW
+        property real batCurrent: NaN   // uA
+        property real batVoltage: NaN   // uV
+        property int acOnline: -1
+        property string batStatus: ""   // Charging, Discharging, Full, Not charging
+
+        // Averaged here, over the last 12 one-second samples, because the
+        // instantaneous reading is close to useless near full. Measured at 95%
+        // on AC, current_now runs a sawtooth with a ~6.5s period: 1.2, 4.6,
+        // 8.0, 5.2, 2.5 W on successive 2s polls -- the charger topping up in
+        // pulses -- and `status` even dips to Full in the troughs. Twelve
+        // seconds is about two periods, which is what settles it.
+        //
+        // Not current_avg, although this battery has it and it is smooth (4.7
+        // to 5.3 W over the same stretch): the gauge averages over about a
+        // minute, and with current unsigned on this driver that minute would
+        // blend the discharge draw from before the cable went in into a number
+        // labelled as charging. Our own window can be thrown away the instant
+        // the direction changes, which the gauge's cannot.
+        //
+        // So the window is keyed on AC-online and on discharging-or-not, and a
+        // change of either clears it. Not on the full status string, because
+        // the Charging/Full flicker above would then reset it every few
+        // seconds and defeat the averaging.
+        property var rateSamples: []
+        property string rateKey: ""
+        property real chargeWatts: NaN
+
+        function sampleRate() {
+            let w = NaN;
+            if (!isNaN(batPower))
+                w = Math.abs(batPower) / 1e6;
+            else if (!isNaN(batCurrent) && !isNaN(batVoltage))
+                w = Math.abs(batCurrent) * batVoltage / 1e12;
+
+            const key = acOnline + (batStatus === "Discharging" ? "-" : "+");
+            let s = key === rateKey ? rateSamples.slice() : [];
+            rateKey = key;
+            if (!isNaN(w))
+                s.push(w);
+            if (s.length > 12)
+                s = s.slice(s.length - 12);
+            rateSamples = s;
+            chargeWatts = s.length ? s.reduce((a, b) => a + b, 0) / s.length : NaN;
+        }
+
+        // A sample is taken when the magnitude file finishes loading, so it is
+        // always a fresh read. Voltage and status may be one tick older, which
+        // is harmless: voltage moves by millivolts a second, and a direction
+        // change shows up on the very next tick.
+        FileView {
+            id: batPowerFile
+            path: info.stat.batPowerPath || ""
+            printErrors: false
+            onLoaded: {
+                info.batPower = Number(text());
+                if (rateTimer.running)
+                    info.sampleRate();
+            }
+            onLoadFailed: info.batPower = NaN
+        }
+
+        FileView {
+            id: batCurrentFile
+            path: info.stat.batCurrentPath || ""
+            printErrors: false
+            onLoaded: {
+                info.batCurrent = Number(text());
+                if (rateTimer.running && !info.stat.batPowerPath)
+                    info.sampleRate();
+            }
+            onLoadFailed: info.batCurrent = NaN
+        }
+
+        FileView {
+            id: batVoltageFile
+            path: info.stat.batVoltagePath || ""
+            printErrors: false
+            onLoaded: info.batVoltage = Number(text())
+            onLoadFailed: info.batVoltage = NaN
+        }
+
+        FileView {
+            id: acOnlineFile
+            path: info.stat.acOnlinePath || ""
+            printErrors: false
+            onLoaded: info.acOnline = Number(text())
+            onLoadFailed: info.acOnline = -1
+        }
+
+        FileView {
+            id: batStatusFile
+            path: info.stat.batStatusPath || ""
+            printErrors: false
+            onLoaded: info.batStatus = text().trim()
+            onLoadFailed: info.batStatus = ""
+        }
+
+        // Only while the popup is open, the same rule as the system page: none
+        // of this is shown anywhere else. 1s because the averaging window above
+        // needs enough samples per sawtooth period to mean anything; five small
+        // sysfs reads and no process, so that costs nothing worth saving.
+        //
+        // The window is cleared each time the popup opens. The files were last
+        // read whenever it was last open, possibly hours ago, and those values
+        // must not seed the average.
+        Timer {
+            id: rateTimer
+            interval: 1000
+            running: root.openPanel === "battery"
+            repeat: true
+            triggeredOnStart: true
+            onRunningChanged: {
+                if (running) {
+                    info.rateSamples = [];
+                    info.rateKey = "";
+                    info.chargeWatts = NaN;
+                }
+            }
+            onTriggered: {
+                batPowerFile.reload();
+                batCurrentFile.reload();
+                batVoltageFile.reload();
+                acOnlineFile.reload();
+                batStatusFile.reload();
+            }
+        }
+
         // key=value, one per line. Split on the first = only -- the DMI strings
         // and os-release values can contain their own.
         function parse(t) {
@@ -533,6 +683,19 @@ for b in /sys/class/power_supply/*; do
       break
     fi
   done
+  # The battery popup's charge rate. power_now (uW) where the driver has it,
+  # which is the energy_* drivers; otherwise current_now (uA) and voltage_now
+  # (uV) multiplied in QML. This machine is the second kind.
+  [ -r "$b/power_now" ] && echo "batPowerPath=$b/power_now"
+  [ -r "$b/current_now" ] && echo "batCurrentPath=$b/current_now"
+  [ -r "$b/voltage_now" ] && echo "batVoltagePath=$b/voltage_now"
+  [ -r "$b/status" ] && echo "batStatusPath=$b/status"
+  break
+done
+# Matched by type rather than by the ADP1/AC name, which varies by driver.
+for a in /sys/class/power_supply/*; do
+  [ "$(cat $a/type 2>/dev/null)" = Mains ] || continue
+  [ -r "$a/online" ] && echo "acOnlinePath=$a/online"
   break
 done
 echo "host=$(cat /proc/sys/kernel/hostname)"
@@ -3496,8 +3659,8 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
         }
     }
 
-    // Battery page: one switch and the one number that is not already on the
-    // bar or the system page.
+    // Battery page: one switch and the numbers that are not already on the bar
+    // or the system page -- time remaining, and the charge rate while on AC.
     //
     // Percentage, health and cycle count are deliberately not repeated here --
     // they are on the system page, and the standing rule in this file is that
@@ -3604,6 +3767,41 @@ echo "public=$(echo "$ip" | tr -d '[:space:]')"
                     if (b.state === UPowerDeviceState.FullyCharged)
                         return "Full, on AC";
                     return "On AC";
+                }
+            }
+
+            // Watts into the battery, only while the cable is in. Labelled as
+            // the battery's intake, not the adapter's output, because that is
+            // what it measures -- see chargeWatts in `info` for why the
+            // adapter's own figure is out of reach. A full cell legitimately
+            // reads near zero here while the adapter is still running the
+            // machine, so a small value is shown as such rather than hidden.
+            //
+            // Driven by sysfs `online`, not upower's state: upower's line-power
+            // entry here had not republished in twenty minutes when checked, and
+            // a row that appears seconds after plugging in is the point.
+            //
+            // The label follows the cell's own status rather than assuming
+            // that a connected cable means charging. "Draining" with the cable
+            // in is the case worth surfacing: the adapter cannot keep up with
+            // the load, and nothing else on screen says so.
+            InfoRow {
+                visible: info.batPresent && info.acOnline === 1
+                width: batCol.width
+                labelWidth: 78
+                label: info.batStatus === "Discharging" ? "Draining" : "Charging"
+                value: {
+                    const w = info.chargeWatts;
+                    if (!info.stat.batPowerPath && !info.stat.batCurrentPath)
+                        return "Unknown";
+                    // The first second after opening, before any sample lands.
+                    if (isNaN(w))
+                        return "Measuring";
+                    if (info.batStatus === "Discharging")
+                        return w.toFixed(1) + " W from battery";
+                    if (w < 0.05)
+                        return info.batStatus === "Full" ? "0 W, full" : "0 W";
+                    return w.toFixed(1) + " W into battery";
                 }
             }
         }
